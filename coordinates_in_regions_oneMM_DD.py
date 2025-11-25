@@ -258,4 +258,23 @@ def _cli():
     parser = argparse.ArgumentParser(
         description="Generate cortical column coordinates in different regions (1mm, DWI)."
     )
-    parser.add_argument("--_
+    parser.add_argument("--ID", required=True, help="Subject ID (e.g., S00775)")
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        required=True,
+        help="Input directory root (contains ID/QSM and ID/ID/label).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="Output directory root (where ID/QSM/label_coord_1mm will be created).",
+    )
+
+    args = parser.parse_args()
+    coordinates_in_regions_oneMM_DD(args.ID, args.input_dir, args.output_dir)
+
+
+if __name__ == "__main__":
+    _cli()
