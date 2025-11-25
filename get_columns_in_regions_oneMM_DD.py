@@ -1,43 +1,21 @@
 #!/usr/bin/env python
 
 """
-Python translation of MATLAB function get_columns_in_regions_oneMM_DD.
+get_columns_in_regions_oneMM_DD.py  (updated, no hardcoded QSM)
 
-Original MATLAB:
-
-    get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir)
-
-Behavior:
-- Loads a masked MRI contrast image for the subject (e.g. QSM, T1, FA, etc.).
-- For each cortical region in a fixed list, loads per-region column coordinates
-  (lh_cp_dwi / rh_cp_dwi) in DWI/contrast voxel space.
-- Samples the contrast image along each column (21 depth samples per column).
-- Writes per-region LH and RH value matrices as CSV files.
-
-Python CLI usage example:
-
-    python get_columns_in_regions_oneMM_DD.py \
-        --ID S00775 \
-        --input-dir  /mnt/newStor/paros/paros_WORK/hanwen/ad_decode_test/input/ \
-        --output-dir /mnt/newStor/paros/paros_WORK/column_code_tester/ \
-        --contrast QSM
-
-Assumed layout:
-
-    Contrast image:
-        <input_dir>/<ID>/<ID>_<contrast>_masked.nii.gz
-
-    Column coordinate .mat files (from coordinates_in_regions_oneMM_DD):
-        <output_dir>/<ID>/QSM/label_coord_1mm/lh_<region>.mat
-        <output_dir>/<ID>/QSM/label_coord_1mm/rh_<region>.mat
-
-    Output CSVs:
-        <output_dir>/<ID>/QSM/<ID>_lh_<region>_cols_<contrast>.csv
-        <output_dir>/<ID>/QSM/<ID>_rh_<region>_cols_<contrast>.csv
+Changes:
+- No 'QSM' hard-coded anywhere.
+- Output directories now use <output_dir>/<ID>/<contrast>/...
+- Per-column outputs:   <output_dir>/<ID>/<contrast>/<contrast>_cols_by_column/
+- Region-mean outputs:  <output_dir>/<ID>/<contrast>/<contrast>_cols_region_mean/
+- Label coords expected in: <output_dir>/<ID>/<contrast>/label_coord_1mm/
+- Print shapes for debugging
+- Save summary CSV
 """
 
 import argparse
 from pathlib import Path
+import csv
 
 import numpy as np
 import nibabel as nib
@@ -45,7 +23,6 @@ from scipy.io import loadmat
 from scipy.ndimage import map_coordinates
 
 
-# Fixed list of cortical regions (must match MATLAB region_list)
 REGION_LIST = [
     "bankssts",
     "caudalanteriorcingulate",
@@ -84,237 +61,171 @@ REGION_LIST = [
 ]
 
 
-# ------------------ IMAGE LOADING ------------------ #
+# ---------------- IMAGE LOADING ---------------- #
 
 def _load_contrast_image(input_dir: Path, ID: str, contrast: str) -> np.ndarray:
-    """
-    Load the subject's masked contrast image:
-
-        <input_dir>/<ID>/<ID>_<contrast>_masked.nii.gz
-
-    Example:
-        /.../input/S00775/S00775_QSM_masked.nii.gz
-    """
     image_path = input_dir / ID / f"{ID}_{contrast}_masked.nii.gz"
-    print(f"[IMG] Looking for {contrast} image at: {image_path}")
+    print(f"[IMG] Looking for <{contrast}> image at: {image_path}")
 
     if not image_path.is_file():
-        raise FileNotFoundError(
-            f"Subject {ID} missing contrast image: {image_path}"
-        )
+        raise FileNotFoundError(f"Missing masked {contrast} image: {image_path}")
 
     img = nib.load(str(image_path))
     vol = img.get_fdata()
 
-    # If 4D (e.g., time series), take first volume
     if vol.ndim == 4:
         vol = vol[..., 0]
 
-    print(f"[IMG] Loaded {contrast} volume with shape: {vol.shape}")
+    print(f"[IMG] Loaded volume: shape {vol.shape}")
     return vol
 
 
-# ------------------ COLUMN COORD LOADING ------------------ #
+# --------------- LOAD COORDS ------------------- #
 
 def _load_region_cp_dwi(mat_path: Path, hemi: str) -> np.ndarray:
-    """
-    Load per-region column coordinates from a .mat file.
-
-    Expected variable:
-        - lh_<region>.mat → lh_cp_dwi
-        - rh_<region>.mat → rh_cp_dwi
-
-    Shape is typically (4, N): homogeneous coords [x; y; z; 1].
-    We will use only the first 3 rows for sampling.
-    """
     if not mat_path.is_file():
-        raise FileNotFoundError(f"Missing label_coord file: {mat_path}")
+        raise FileNotFoundError(f"Missing coordinate file: {mat_path}")
 
     data = loadmat(mat_path)
     var_name = f"{hemi}_cp_dwi"
 
     if var_name not in data:
-        raise KeyError(f"{mat_path} does not contain variable '{var_name}'")
+        raise KeyError(f"{mat_path} missing variable {var_name}")
 
-    cp_dwi = np.asarray(data[var_name])
-    if cp_dwi.shape[0] < 3:
-        raise ValueError(f"{mat_path}: {var_name} has invalid shape {cp_dwi.shape}")
-
-    print(f"[CP] Loaded {var_name} from {mat_path.name}, shape={cp_dwi.shape}")
-    return cp_dwi
+    cp = np.asarray(data[var_name])
+    print(f"[CP] Loaded {var_name} from {mat_path.name}, shape={cp.shape}")
+    return cp
 
 
-# ------------------ SAMPLING ALONG COLUMNS ------------------ #
+# --------------- SAMPLING ------------------- #
 
-def _sample_columns_from_volume(
-    vol: np.ndarray, cp_dwi: np.ndarray, points_num: int = 21
-) -> np.ndarray:
-    """
-    Sample contrast volume at column coordinates.
-
-    MATLAB logic:
-
-        points_num = 21;
-        columns_num = size(cp_dwi, 2) / 21;
-        values = zeros(columns_num, 21);
-        for i = 1:21
-            index = i:21:(i + 21 * (columns_num-1));
-            values(:, i) = interp3(volumn,
-                                   cp_dwi(1, index),
-                                   cp_dwi(2, index),
-                                   cp_dwi(3, index));
-        end
-
-    Here we replicate that behavior using scipy.ndimage.map_coordinates
-    with linear interpolation (order=1).
-
-    IMPORTANT:
-        - cp_dwi comes from MATLAB, so coordinates are 1-based.
-        - numpy/map_coordinates expects 0-based indices.
-        - We subtract 1.0 from x,y,z to convert to 0-based.
-    """
+def _sample_columns(vol: np.ndarray, cp_dwi: np.ndarray, points_num=21) -> np.ndarray:
     n_coords = cp_dwi.shape[1]
+
     if n_coords % points_num != 0:
-        raise ValueError(
-            f"cp_dwi has {n_coords} columns, not divisible by points_num={points_num}"
-        )
+        raise ValueError(f"Invalid cp_dwi size {n_coords} for points_num {points_num}")
 
-    columns_num = n_coords // points_num
-    print(f"[SAMPLE] columns_num={columns_num}, points_num={points_num}")
+    columns = n_coords // points_num
+    print(f"[SAMPLE] columns={columns}, depths={points_num}")
 
-    # Output: (columns_num, points_num)
-    values = np.zeros((columns_num, points_num), dtype=float)
+    vals = np.zeros((columns, points_num), float)
 
-    # For each depth index i = 0..points_num-1 (corresponds to MATLAB i = 1..21)
-    for depth_idx in range(points_num):
-        # 0-based indices into cp_dwi columns
-        index = depth_idx + np.arange(columns_num) * points_num  # shape (columns_num,)
+    for d in range(points_num):
+        idx = d + np.arange(columns) * points_num
 
-        # Extract coordinates: first three rows are [x; y; z]
-        coords = cp_dwi[0:3, index].astype(float)
+        coords = cp_dwi[0:3, idx].astype(float)
+        coords -= 1.0  # MATLAB → Python indexing
 
-        # Convert 1-based MATLAB coords to 0-based numpy coords
-        coords -= 1.0
-
-        # map_coordinates expects coords in (ndim, N), with axes ordered like vol
         sampled = map_coordinates(
-            vol,
-            coords,
-            order=1,       # linear interpolation
-            mode="nearest" # clamp at edges
+            vol, coords, order=1, mode="nearest"
         )
+        vals[:, d] = sampled
 
-        values[:, depth_idx] = sampled
-
-    return values
+    return vals
 
 
-# ------------------ MAIN LOGIC ------------------ #
+# ---------------- MAIN ---------------- #
 
-def get_columns_in_regions_oneMM_DD(ID: str, input_dir, output_dir, contrast: str):
-    """
-    Python implementation of get_columns_in_regions_oneMM_DD.
+def get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir, contrast):
 
-    Parameters
-    ----------
-    ID : str
-        Subject ID (e.g. 'S00775').
-    input_dir : str or Path
-        Root dir containing the masked contrast image:
-            <input_dir>/<ID>/<ID>_<contrast>_masked.nii.gz
-    output_dir : str or Path
-        Root dir containing label_coord_1mm (from coordinates_in_regions_oneMM_DD)
-        and where we will write the per-region CSVs:
-            <output_dir>/<ID>/QSM/label_coord_1mm
-            <output_dir>/<ID>/QSM/<ID>_lh_<region>_cols_<contrast>.csv
-            <output_dir>/<ID>/QSM/<ID>_rh_<region>_cols_<contrast>.csv
-    contrast : str
-        Contrast name, e.g. 'QSM', 'T1', 'FA', 'MD'. Used for both
-        input image filename and output CSV suffix.
-    """
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
 
-    print(f"\n[INFO] Subject:   {ID}")
-    print(f"[INFO] Input dir: {input_dir}")
-    print(f"[INFO] Output dir:{output_dir}")
-    print(f"[INFO] Contrast:  {contrast}")
+    print(f"\n[INFO] Running for subject {ID}")
+    print(f"[INFO] Contrast: {contrast}")
+    print(f"[INFO] I/O roots:")
+    print(f"    input_dir:  {input_dir}")
+    print(f"    output_dir: {output_dir}")
 
-    # Load contrast volume
+    # load MRI contrast
     vol = _load_contrast_image(input_dir, ID, contrast)
 
-    # Where region coordinate .mat files live
-    label_coord_dir = output_dir / ID / "QSM" / "label_coord_1mm"
+    # expected label coord folder from script 1
+    label_coord_dir = output_dir / ID / contrast / "label_coord_1mm"
     if not label_coord_dir.is_dir():
-        raise FileNotFoundError(f"Label coord dir not found: {label_coord_dir}")
+        raise FileNotFoundError(f"Missing label_coord_1mm in: {label_coord_dir}")
 
-    # Where to write region-wise contrast column values
-    out_qsm_dir = output_dir / ID / "QSM"
-    out_qsm_dir.mkdir(parents=True, exist_ok=True)
+    # new output layout
+    contrast_dir = output_dir / ID / contrast
 
-    points_num = 21  # must match vertices_connect.m / coordinates_in_regions_oneMM_DD.m
+    per_column_dir = contrast_dir / f"{contrast}_cols_by_column"
+    per_mean_dir = contrast_dir / f"{contrast}_cols_region_mean"
 
-    for region_name in REGION_LIST:
-        print(f"\n[REGION] {region_name}")
+    per_column_dir.mkdir(parents=True, exist_ok=True)
+    per_mean_dir.mkdir(parents=True, exist_ok=True)
 
-        lh_mat_path = label_coord_dir / f"lh_{region_name}.mat"
-        rh_mat_path = label_coord_dir / f"rh_{region_name}.mat"
+    points_num = 21
+    summary = []
 
-        if not lh_mat_path.is_file() or not rh_mat_path.is_file():
-            print(f"  -> Missing label files for {region_name}, skipping.")
+    # loop over regions
+    for region in REGION_LIST:
+        print(f"\n[REGION] {region}")
+
+        lh_mat = label_coord_dir / f"lh_{region}.mat"
+        rh_mat = label_coord_dir / f"rh_{region}.mat"
+
+        if not lh_mat.is_file() or not rh_mat.is_file():
+            print(f"  -> missing lh/rh coord files, skipping region")
             continue
 
-        # Load per-region coordinates
-        lh_cp_dwi = _load_region_cp_dwi(lh_mat_path, hemi="lh")
-        rh_cp_dwi = _load_region_cp_dwi(rh_mat_path, hemi="rh")
+        # coord matrices
+        lh_cp = _load_region_cp_dwi(lh_mat, "lh")
+        rh_cp = _load_region_cp_dwi(rh_mat, "rh")
 
-        # Sample contrast volume along columns
-        lh_values = _sample_columns_from_volume(vol, lh_cp_dwi, points_num=points_num)
-        rh_values = _sample_columns_from_volume(vol, rh_cp_dwi, points_num=points_num)
+        # sample
+        lh_vals = _sample_columns(vol, lh_cp, points_num)
+        rh_vals = _sample_columns(vol, rh_cp, points_num)
 
-        # Write CSV outputs with contrast in the name
-        lh_csv_path = out_qsm_dir / f"{ID}_lh_{region_name}_cols_{contrast}.csv"
-        rh_csv_path = out_qsm_dir / f"{ID}_rh_{region_name}_cols_{contrast}.csv"
+        # --------- save per-column output ---------
+        lh_path = per_column_dir / f"{ID}_lh_{region}_cols_{contrast}.csv"
+        rh_path = per_column_dir / f"{ID}_rh_{region}_cols_{contrast}.csv"
 
-        np.savetxt(lh_csv_path, lh_values, delimiter=",")
-        np.savetxt(rh_csv_path, rh_values, delimiter=",")
+        np.savetxt(lh_path, lh_vals, delimiter=",")
+        np.savetxt(rh_path, rh_vals, delimiter=",")
 
-        print(f"  -> WROTE {lh_csv_path.name} (shape {lh_values.shape})")
-        print(f"  -> WROTE {rh_csv_path.name} (shape {rh_values.shape})")
+        print(f"  -> LH per-column saved ({lh_vals.shape}) → {lh_path}")
+        print(f"  -> RH per-column saved ({rh_vals.shape}) → {rh_path}")
+
+        summary.append(["lh", region, lh_vals.shape[0], lh_vals.shape[1], lh_path.name])
+        summary.append(["rh", region, rh_vals.shape[0], rh_vals.shape[1], rh_path.name])
+
+        # --------- region mean depth profile ---------
+        lh_mean = lh_vals.mean(axis=0).reshape(-1, 1)
+        rh_mean = rh_vals.mean(axis=0).reshape(-1, 1)
+
+        lh_mean_path = per_mean_dir / f"{ID}_lh_{region}_cols_{contrast}_mean.csv"
+        rh_mean_path = per_mean_dir / f"{ID}_rh_{region}_cols_{contrast}_mean.csv"
+
+        np.savetxt(lh_mean_path, lh_mean, delimiter=",")
+        np.savetxt(rh_mean_path, rh_mean, delimiter=",")
+
+        print(f"  -> LH depth-mean saved (21×1) → {lh_mean_path}")
+        print(f"  -> RH depth-mean saved (21×1) → {rh_mean_path}")
+
+    # --------- summary CSV ---------
+    if summary:
+        summary_path = per_column_dir / f"{ID}_cols_{contrast}_summary.csv"
+        with open(summary_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["hemi", "region", "n_columns", "n_depths", "csv_file"])
+            writer.writerows(summary)
+        print(f"\n[SUMMARY] wrote: {summary_path}")
+    else:
+        print("\n[SUMMARY] no regions processed.")
 
 
-# ------------------ CLI ENTRY ------------------ #
+# ---------------- CLI ---------------- #
 
 def _cli():
-    parser = argparse.ArgumentParser(
-        description="Sample MRI contrast along cortical columns in predefined regions."
-    )
-    parser.add_argument("--ID", required=True, help="Subject ID (e.g., S00775)")
-    parser.add_argument(
-        "--input-dir",
-        type=Path,
-        required=True,
-        help="Root directory containing <ID>/<ID>_<contrast>_masked.nii.gz"
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        required=True,
-        help="Root directory for label_coord_1mm and per-region CSV outputs."
-    )
-    parser.add_argument(
-        "--contrast",
-        required=True,
-        help="Contrast name, e.g. QSM, T1, FA, MD. "
-             "Script looks for <ID>_<contrast>_masked.nii.gz"
-    )
+    p = argparse.ArgumentParser()
+    p.add_argument("--ID", required=True)
+    p.add_argument("--input-dir", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--contrast", required=True)
+    args = p.parse_args()
 
-    args = parser.parse_args()
     get_columns_in_regions_oneMM_DD(
-        args.ID,
-        args.input_dir,
-        args.output_dir,
-        args.contrast,
+        args.ID, args.input_dir, args.output_dir, args.contrast
     )
 
 
