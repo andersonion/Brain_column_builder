@@ -31,12 +31,31 @@ get_columns_in_regions_oneMM_DD.py
 import argparse
 from pathlib import Path
 import csv
+import hashlib
 
 import numpy as np
 import nibabel as nib
 from scipy.io import loadmat
 from scipy.ndimage import map_coordinates
 import matplotlib.pyplot as plt
+
+
+PIPELINE_VERSION = "get_columns_v1.0_20251125"
+
+
+def _region_checksum(ID: str, contrast: str, region: str) -> str:
+    """Return a stable checksum string for one region's config.
+
+    Currently based on pipeline version, subject ID, contrast name, and region name.
+    If you change processing logic in a way that invalidates old outputs,
+    bump PIPELINE_VERSION to force recompute.
+    """
+    h = hashlib.sha256()
+    h.update(PIPELINE_VERSION.encode("utf-8"))
+    h.update(ID.encode("utf-8"))
+    h.update(contrast.encode("utf-8"))
+    h.update(region.encode("utf-8"))
+    return h.hexdigest()
 
 
 REGION_LIST = [
@@ -96,26 +115,39 @@ def _load_contrast_image(input_dir: Path, ID: str, contrast: str) -> np.ndarray:
     return vol
 
 
-# --------------- LOAD COORDS ------------------- #
+# ---------------- COORDS LOADING ---------------- #
 
 def _load_region_cp_dwi(mat_path: Path, hemi: str) -> np.ndarray:
-    if not mat_path.is_file():
-        raise FileNotFoundError(f"Missing coordinate file: {mat_path}")
+    """
+    Load cp_dwi for a single region/hemisphere.
 
+    mat_path: lh_<region>.mat or rh_<region>.mat
+    hemi: "lh" or "rh"
+    """
     data = loadmat(mat_path)
-    var_name = f"{hemi}_cp_dwi"
+    key_candidates = [
+        f"{hemi}_cp_dwi",
+        "cp_dwi",
+    ]
 
-    if var_name not in data:
-        raise KeyError(f"{mat_path} missing variable {var_name}")
+    for key in key_candidates:
+        if key in data:
+            cp = np.asarray(data[key])
+            print(f"[MAT] Loaded {key} from {mat_path.name} with shape {cp.shape}")
+            return cp
 
-    cp = np.asarray(data[var_name])
-    print(f"[CP] Loaded {var_name} from {mat_path.name}, shape={cp.shape}")
-    return cp
+    raise KeyError(
+        f"None of {key_candidates} found in {mat_path.name}. Keys: {list(data.keys())}"
+    )
 
 
-# --------------- SAMPLING ------------------- #
+# --------------- SAMPLING ALONG COLUMNS ----------------- #
 
-def _sample_columns(vol: np.ndarray, cp_dwi: np.ndarray, points_num=21) -> np.ndarray:
+def _sample_columns(
+    vol: np.ndarray,
+    cp_dwi: np.ndarray,
+    points_num: int,
+) -> np.ndarray:
     """
     Sample volume at coordinates in cp_dwi.
 
@@ -146,31 +178,32 @@ def _sample_columns(vol: np.ndarray, cp_dwi: np.ndarray, points_num=21) -> np.nd
     return vals
 
 
-# --------------- QA HELPERS ------------------- #
+# --------------- QA HELPERS ----------------- #
 
-def _compute_mean_and_ci(values: np.ndarray, ci_level: float = 0.95):
+def _compute_mean_and_ci(
+    vals: np.ndarray,
+    ci_level: float = 0.95,
+):
     """
-    Given values shape (n_columns, n_depths),
-    return mean, ci_lower, ci_upper each shape (n_depths,).
-
-    CI is computed as mean ± z * SEM with z from normal approximation.
+    vals: (N_columns, N_depths)
+    Returns:
+        mean: (N_depths,)
+        ci_low: (N_depths,)
+        ci_high: (N_depths,)
+        n_columns: int
     """
-    n_cols = values.shape[0]
-    if n_cols < 2:
-        # no variance estimate; just return mean and identical bounds
-        mean = values.mean(axis=0)
-        return mean, mean.copy(), mean.copy(), n_cols
+    if vals.size == 0:
+        raise ValueError("Empty vals in _compute_mean_and_ci")
 
-    mean = values.mean(axis=0)
-    std = values.std(axis=0, ddof=1)
+    n_cols = vals.shape[0]
+    mean = vals.mean(axis=0)
+
+    # two-sided normal CI
+    from scipy.stats import norm
+
+    z = norm.ppf(0.5 + ci_level / 2.0)
+    std = vals.std(axis=0, ddof=1)
     sem = std / np.sqrt(n_cols)
-
-    # For 95% CI, z ≈ 1.96. Could generalize but 0.95 is the common case.
-    if ci_level == 0.95:
-        z = 1.96
-    else:
-        from scipy.stats import norm
-        z = norm.ppf(0.5 + ci_level / 2.0)
 
     ci_low = mean - z * sem
     ci_high = mean + z * sem
@@ -204,7 +237,7 @@ def _plot_profile_with_ci(
 
 # ---------------- MAIN ---------------- #
 
-def get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir, contrast):
+def get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir, contrast, force=False):
 
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
@@ -214,6 +247,8 @@ def get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir, contrast):
     print(f"[INFO] I/O roots:")
     print(f"    input_dir:  {input_dir}")
     print(f"    output_dir: {output_dir}")
+    print(f"[INFO] Pipeline version: {PIPELINE_VERSION}")
+    print(f"[INFO] FORCE mode: {force}")
 
     # load MRI contrast
     vol = _load_contrast_image(input_dir, ID, contrast)
@@ -250,6 +285,45 @@ def get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir, contrast):
             print(f"  -> missing lh/rh coord files, skipping region")
             continue
 
+        # expected per-region outputs
+        lh_path = per_column_dir / f"{ID}_lh_{region}_cols_{contrast}.csv"
+        rh_path = per_column_dir / f"{ID}_rh_{region}_cols_{contrast}.csv"
+        lh_mean_path = per_mean_dir / f"{ID}_lh_{region}_cols_{contrast}_mean.csv"
+        rh_mean_path = per_mean_dir / f"{ID}_rh_{region}_cols_{contrast}_mean.csv"
+        lh_png_path = qa_dir / f"{ID}_lh_{region}_profile_{contrast}.png"
+        rh_png_path = qa_dir / f"{ID}_rh_{region}_profile_{contrast}.png"
+        checksum_path = qa_dir / f"{ID}_{region}_cols_{contrast}.sha256"
+
+        outputs_exist = (
+            lh_path.is_file()
+            and rh_path.is_file()
+            and lh_mean_path.is_file()
+            and rh_mean_path.is_file()
+            and lh_png_path.is_file()
+            and rh_png_path.is_file()
+        )
+
+        checksum_ok = False
+        if checksum_path.is_file():
+            try:
+                stored = checksum_path.read_text().strip()
+                expected = _region_checksum(ID, contrast, region)
+                if stored == expected:
+                    checksum_ok = True
+            except Exception as e:
+                print(f"  [WARN] could not read checksum for region {region}: {e}")
+
+        if (not force) and outputs_exist and checksum_ok:
+            print("  -> outputs + checksum present; skipping recompute for this region")
+            continue
+        elif force:
+            print("  -> FORCE recompute for this region")
+        else:
+            if outputs_exist and not checksum_ok:
+                print("  -> outputs exist but checksum missing/mismatch; recomputing region")
+            else:
+                print("  -> outputs missing; computing region")
+
         # coord matrices
         lh_cp = _load_region_cp_dwi(lh_mat, "lh")
         rh_cp = _load_region_cp_dwi(rh_mat, "rh")
@@ -259,9 +333,6 @@ def get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir, contrast):
         rh_vals = _sample_columns(vol, rh_cp, points_num)
 
         # --------- save per-column output ---------
-        lh_path = per_column_dir / f"{ID}_lh_{region}_cols_{contrast}.csv"
-        rh_path = per_column_dir / f"{ID}_rh_{region}_cols_{contrast}.csv"
-
         np.savetxt(lh_path, lh_vals, delimiter=",")
         np.savetxt(rh_path, rh_vals, delimiter=",")
 
@@ -275,9 +346,6 @@ def get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir, contrast):
         lh_mean_profile = lh_vals.mean(axis=0).reshape(-1, 1)
         rh_mean_profile = rh_vals.mean(axis=0).reshape(-1, 1)
 
-        lh_mean_path = per_mean_dir / f"{ID}_lh_{region}_cols_{contrast}_mean.csv"
-        rh_mean_path = per_mean_dir / f"{ID}_rh_{region}_cols_{contrast}_mean.csv"
-
         np.savetxt(lh_mean_path, lh_mean_profile, delimiter=",")
         np.savetxt(rh_mean_path, rh_mean_profile, delimiter=",")
 
@@ -287,7 +355,6 @@ def get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir, contrast):
         # --------- QA: mean + CI + plots ---------
         # LH
         lh_mean, lh_ci_low, lh_ci_high, lh_n = _compute_mean_and_ci(lh_vals, ci_level=0.95)
-        lh_png_path = qa_dir / f"{ID}_lh_{region}_profile_{contrast}.png"
         _plot_profile_with_ci(
             depth_indices,
             lh_mean,
@@ -304,7 +371,6 @@ def get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir, contrast):
 
         # RH
         rh_mean, rh_ci_low, rh_ci_high, rh_n = _compute_mean_and_ci(rh_vals, ci_level=0.95)
-        rh_png_path = qa_dir / f"{ID}_rh_{region}_profile_{contrast}.png"
         _plot_profile_with_ci(
             depth_indices,
             rh_mean,
@@ -312,12 +378,18 @@ def get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir, contrast):
             rh_ci_high,
             rh_png_path,
             title=f"{ID} rh {region} ({contrast})",
-            contrast=contrast,
-        )
+            contrast=contrast),
         print(f"  -> RH QA plot saved → {rh_png_path}")
 
         for d_idx, m, lo, hi in zip(depth_indices, rh_mean, rh_ci_low, rh_ci_high):
             qa_rows.append(["rh", region, int(d_idx), float(m), float(lo), float(hi), int(rh_n)])
+
+        # --------- region checksum marker ---------
+        try:
+            checksum = _region_checksum(ID, contrast, region)
+            checksum_path.write_text(checksum + "\n")
+        except Exception as e:
+            print(f"  [WARN] could not write checksum for region {region}: {e}")
 
     # --------- per-column summary CSV ---------
     if summary:
@@ -351,13 +423,30 @@ def _cli():
         description="Sample MRI contrast along cortical columns and generate QA outputs."
     )
     p.add_argument("--ID", required=True, help="Subject ID, e.g. S00775")
-    p.add_argument("--input-dir", required=True, help="Root containing <ID>/<ID>_<contrast>_masked.nii.gz")
-    p.add_argument("--output-dir", required=True, help="Root for <ID>/<contrast>/...")
-    p.add_argument("--contrast", required=True, help="Contrast name, e.g. QSM, T1, FA, MD")
+    p.add_argument(
+        "--input-dir",
+        required=True,
+        help="Root containing <ID>/<ID>_<contrast>_masked.nii.gz",
+    )
+    p.add_argument(
+        "--output-dir",
+        required=True,
+        help="Root for <ID>/<contrast>/...",
+    )
+    p.add_argument(
+        "--contrast",
+        required=True,
+        help="Contrast name, e.g. QSM, T1, FA, MD",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompute regions even if outputs + checksum exist.",
+    )
     args = p.parse_args()
 
     get_columns_in_regions_oneMM_DD(
-        args.ID, args.input_dir, args.output_dir, args.contrast
+        args.ID, args.input_dir, args.output_dir, args.contrast, force=args.force
     )
 
 
