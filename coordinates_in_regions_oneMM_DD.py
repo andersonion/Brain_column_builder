@@ -17,6 +17,9 @@ Dependencies:
     numpy
     scipy (scipy.io.loadmat, scipy.io.savemat)
     nibabel (for reading .annot files)
+
+Test command:	
+python coordinates_in_regions_oneMM_DD.py  --ID S00775 --input-dir /mnt/newStor/paros/paros_WORK/hanwen/ad_decode_test/output/  --output-dir /mnt/newStor/paros/paros_WORK/column_code_tester/
 """
 
 import argparse
@@ -213,7 +216,7 @@ def coordinates_in_regions_oneMM_DD(ID: str, input_dir, output_dir):
     # Check required .mat file (_column_lh.mat) exists, as in MATLAB
     col_lh_mat = qsm_dir / f"{ID}_column_lh.mat"
     if not col_lh_mat.is_file():
-        print(f"Subject {ID} doesnt have columns result")
+        print(f"Subject {ID} doesnt have columns result; looked in {col_lh_mat}")
         return
 
     # Load lh_cp_dwi, rh_cp_dwi
@@ -251,8 +254,8 @@ def _cli():
     Example:
         python coordinates_in_regions_oneMM_DD.py \\
             --ID S00775 \\
-            --input-dir /Volumes/newJetStor/newJetStor/paros/paros_WORK/hanwen/ad_decode_test/output/ \\
-            --output-dir /Volumes/newJetStor/newJetStor/paros/paros_WORK/hanwen/ad_decode_test/output/
+            --input-dir /mnt/newStor/paros/paros_WORK/hanwen/ad_decode_test/output/ \\
+            --output-dir /mnt/newStor/paros/paros_WORK/hanwen/ad_decode_test/output/
     """
     parser = argparse.ArgumentParser(
         description="Generate cortical column coordinates in different regions (1mm, DWI)."
@@ -281,3 +284,4 @@ def _cli():
 
 if __name__ == "__main__":
     _cli()
+	
