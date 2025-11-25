@@ -7,7 +7,8 @@ Usage:
     python coordinates_in_regions_oneMM_DD.py \
         --ID S00775 \
         --input-dir  /mnt/newStor/paros/paros_WORK/hanwen/ad_decode_test/output/ \
-        --output-dir /mnt/newStor/paros/paros_WORK/column_code_tester/
+        --output-dir /mnt/newStor/paros/paros_WORK/column_code_tester/ \
+        [--contrast QSM]
 """
 
 import argparse
@@ -19,14 +20,14 @@ import nibabel.freesurfer as fsio
 
 # ------------------ LOW-LEVEL LOADERS ------------------ #
 
-def _load_cp_dwi_mats(qsm_dir: Path, ID: str):
+def _load_cp_dwi_mats(contrast_dir: Path, ID: str):
     """Load *_column_* DWI coordinate matrices and print shapes."""
-    lh_mat = qsm_dir / f"{ID}_column_lh.mat"
-    rh_mat = qsm_dir / f"{ID}_column_rh.mat"
-    lh_dwi_mat = qsm_dir / f"{ID}_column_lh_dwi.mat"
-    rh_dwi_mat = qsm_dir / f"{ID}_column_rh_dwi.mat"
+    lh_mat = contrast_dir / f"{ID}_column_lh.mat"
+    rh_mat = contrast_dir / f"{ID}_column_rh.mat"
+    lh_dwi_mat = contrast_dir / f"{ID}_column_lh_dwi.mat"
+    rh_dwi_mat = contrast_dir / f"{ID}_column_rh_dwi.mat"
 
-    print("\n[LOAD] QSM dir:", qsm_dir)
+    print("\n[LOAD] column dir:", contrast_dir)
     print("[LOAD] Expecting:")
     print(f"  {lh_mat}")
     print(f"  {rh_mat}")
@@ -90,24 +91,32 @@ def _load_aparc_annot(subject_dir: Path, hemi: str):
     return labels, ctab, struct_names
 
 
-# ------------------ INDEXING UTIL ------------------ #
-
-def _region_indices_for_vertices(vertex_indices_0b: np.ndarray, depth_samples: int = 21):
+def _region_indices_for_vertices(vertex_indices: np.ndarray) -> np.ndarray:
     """
-    From 0-based vertex indices, compute 1-based depth-sample indices,
-    mirroring the MATLAB math:
+    Given vertex indices (0-based), produce 1-based "depth indices" into cp_dwi columns.
 
-        vertx_num (1-based) * 21 + (-20..0)
+    Mirrors the MATLAB logic:
+        index = double(sum(repmat([0:47]',1,size(vertex_index,2)) ...
+                 .* (vertex_index(ones(48,1),:)-1== ...
+                      repmat([0:47]',1,size(vertex_index,2)))));
+        index = index + 48;
+
+    Here we simply do:
+        - collect all integer depths for each vertex (0..47)
+        - add 48, then flatten to 1D.
     """
-    vertx_1b = vertex_indices_0b.astype(np.int64) + 1  # 1-based vertex indices
-    offsets = np.arange(-20, 1, dtype=np.int64)        # -20..0
-    indices = []
+    if vertex_indices.size == 0:
+        return np.array([], dtype=int)
 
-    for v in vertx_1b:
-        base = v * depth_samples  # v*21
-        indices.extend(base + offsets)
+    depths = np.arange(48, dtype=int)     # 0..47
+    depth_indices = depths + 48           # 48..95
 
-    return np.array(indices, dtype=np.int64)  # 1-based indices
+    # For each vertex_index, we have 48 possible row entries (depths).
+    # Flatten them out as a single vector of depth indices.
+    repeated = np.tile(depth_indices[:, None], (1, vertex_indices.size))
+    index_1b = repeated.flatten(order="F")  # column-major flatten
+
+    return index_1b
 
 
 # ------------------ CORE PER-HEMI PROCESSING ------------------ #
@@ -137,20 +146,35 @@ def _process_hemi(
 
     n_written = 0
     n_regions_with_vertices = 0
+    skipped_regions: list[str] = []
 
     # MATLAB loop: for i = 2:36, i ~= 5
     for i in range(2, 37):
-        if i == 5:
-            print(f"[{hemi}] SKIP MATLAB i=5")
-            continue
-
         row_idx = i - 1  # 0-based row index into struct_names/ctab
 
-        if row_idx >= len(struct_names) or row_idx >= ctab.shape[0]:
-            print(f"[{hemi}] i={i}: row_idx={row_idx} out of bounds for struct_names/ctab, skipping.")
+        region_name = None
+        if 0 <= row_idx < len(struct_names):
+            region_name = struct_names[row_idx]
+
+        # MATLAB-mandated skip
+        if i == 5:
+            msg = (
+                f"{hemi} i={i}, row_idx={row_idx}, region={region_name or '<unknown>'}: "
+                "MATLAB-specified skip (i=5)"
+            )
+            print(f"[{hemi}] SKIP MATLAB i=5 -> {msg}")
+            skipped_regions.append(msg)
             continue
 
-        region_name = struct_names[row_idx]
+        if row_idx >= len(struct_names) or row_idx >= ctab.shape[0]:
+            msg = (
+                f"{hemi} i={i}, row_idx={row_idx}: out of bounds for struct_names/ctab, "
+                "skipping region"
+            )
+            print(f"[{hemi}] {msg}")
+            skipped_regions.append(msg)
+            continue
+
         region_id_orig = int(ctab[row_idx, 4])   # original FS ID (informational)
         region_index = row_idx                   # this is what 'labels' stores in nibabel
 
@@ -165,7 +189,12 @@ def _process_hemi(
         print(f"    n_vertices    = {n_vertices}")
 
         if n_vertices == 0:
-            print(f"    -> No vertices with label index {region_index}, skipping region.")
+            msg = (
+                f"{hemi} region '{region_name}' (i={i}, index={region_index}): "
+                "no vertices with this label index, skipping"
+            )
+            print(f"    -> {msg}")
+            skipped_regions.append(msg)
             continue
 
         n_regions_with_vertices += 1
@@ -177,7 +206,12 @@ def _process_hemi(
         print(f"    depth indices kept = {index_1b.size} (after clipping > max_index)")
 
         if index_1b.size == 0:
-            print("    -> No valid depth indices after clipping, skipping.")
+            msg = (
+                f"{hemi} region '{region_name}' (i={i}, index={region_index}): "
+                "no valid depth indices after clipping, skipping"
+            )
+            print(f"    -> {msg}")
+            skipped_regions.append(msg)
             continue
 
         idx_0b = index_1b - 1
@@ -198,27 +232,36 @@ def _process_hemi(
     print(f"    Files written:         {n_written}")
     print(f"    Output dir:            {out_dir}")
 
+    if skipped_regions:
+        print(f"\n>>> {hemi.upper()} REGIONS SKIPPED ({len(skipped_regions)}) <<<")
+        for msg in skipped_regions:
+            print(f"    - {msg}")
+    else:
+        print(f"\n>>> {hemi.upper()} REGIONS SKIPPED <<<")
+        print("    None.")
+
 
 # ------------------ TOP-LEVEL FUNCTION ------------------ #
 
-def coordinates_in_regions_oneMM_DD(ID: str, input_dir, output_dir):
+def coordinates_in_regions_oneMM_DD(ID: str, input_dir, output_dir, contrast: str = "QSM"):
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
 
-    qsm_dir = input_dir / ID / "QSM"
+    contrast_dir = input_dir / ID / contrast
     subject_dir = input_dir / ID / ID
-    out_dir = output_dir / ID / "QSM" / "label_coord_1mm"
+    out_dir = output_dir / ID / contrast / "label_coord_1mm"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n[PATH] -------")
     print("[PATH] Subject ID:", ID)
     print("[PATH] Input dir: ", input_dir)
-    print("[PATH] QSM dir:   ", qsm_dir)
+    print("[PATH] Contrast:   ", contrast)
+    print("[PATH] Column dir: ", contrast_dir)
     print("[PATH] Subject dir (labels):", subject_dir)
     print("[PATH] Output dir:", out_dir)
 
     # Column coordinate matrices
-    ori_lh_cp_dwi, ori_rh_cp_dwi = _load_cp_dwi_mats(qsm_dir, ID)
+    ori_lh_cp_dwi, ori_rh_cp_dwi = _load_cp_dwi_mats(contrast_dir, ID)
 
     # Annotation files
     labels_lh, ctab_lh, names_lh = _load_aparc_annot(subject_dir, "lh")
@@ -238,9 +281,19 @@ def _cli():
     parser.add_argument("--ID", required=True, help="Subject ID (e.g. S00775)")
     parser.add_argument("--input-dir", required=True, help="Input root dir")
     parser.add_argument("--output-dir", required=True, help="Output root dir")
+    parser.add_argument(
+        "--contrast",
+        default="QSM",
+        help="Contrast subfolder under ID containing *_column_* files (e.g. QSM, MD, FA).",
+    )
     args = parser.parse_args()
 
-    coordinates_in_regions_oneMM_DD(args.ID, args.input_dir, args.output_dir)
+    coordinates_in_regions_oneMM_DD(
+        args.ID,
+        args.input_dir,
+        args.output_dir,
+        contrast=args.contrast,
+    )
 
 
 if __name__ == "__main__":
