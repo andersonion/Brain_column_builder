@@ -224,7 +224,7 @@ def get_thickness(ID: str, output_dir):
 
         # ---- LH hemisphere ---- #
         region_name_lh = names_lh[region_idx]
-		vert_idx_lh = np.where(labels_lh == region_idx)[0]
+        vert_idx_lh = np.where(labels_lh == region_idx)[0]
 
         if vert_idx_lh.size == 0:
             print(f"[LH] Region '{region_name_lh}' has 0 vertices, skipping.")
