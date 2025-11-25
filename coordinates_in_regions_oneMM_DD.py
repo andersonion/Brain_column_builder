@@ -17,9 +17,6 @@ Dependencies:
     numpy
     scipy (scipy.io.loadmat, scipy.io.savemat)
     nibabel (for reading .annot files)
-
-Test command:	
-python coordinates_in_regions_oneMM_DD.py  --ID S00775 --input-dir /mnt/newStor/paros/paros_WORK/hanwen/ad_decode_test/output/  --output-dir /mnt/newStor/paros/paros_WORK/column_code_tester/
 """
 
 import argparse
@@ -43,14 +40,17 @@ def _load_cp_dwi_mats(qsm_dir: Path, ID: str):
     In practice, we only need lh_cp_dwi and rh_cp_dwi (DWI space),
     but we mirror the original loads for completeness.
     """
-    # The first two loads may set up things the original pipeline expects;
-    # here we just load them to be safe, even if unused.
     lh_mat = qsm_dir / f"{ID}_column_lh.mat"
     rh_mat = qsm_dir / f"{ID}_column_rh.mat"
     lh_dwi_mat = qsm_dir / f"{ID}_column_lh_dwi.mat"
     rh_dwi_mat = qsm_dir / f"{ID}_column_rh_dwi.mat"
 
-    # Load (ignore content for non-DWI if you like, but we read them anyway)
+    if not lh_dwi_mat.is_file():
+        raise FileNotFoundError(f"Missing required file: {lh_dwi_mat}")
+    if not rh_dwi_mat.is_file():
+        raise FileNotFoundError(f"Missing required file: {rh_dwi_mat}")
+
+    # These two are loaded in MATLAB; we do the same even if we don't use them directly.
     if lh_mat.is_file():
         _ = loadmat(lh_mat)
     if rh_mat.is_file():
@@ -74,7 +74,7 @@ def _load_cp_dwi_mats(qsm_dir: Path, ID: str):
     return ori_lh_cp_dwi, ori_rh_cp_dwi
 
 
-def _load_aparc_annot(subject_dir: Path, ID: str, hemi: str):
+def _load_aparc_annot(subject_dir: Path, hemi: str):
     """
     Load FreeSurfer aparc annotation for one hemisphere.
 
@@ -94,9 +94,10 @@ def _load_aparc_annot(subject_dir: Path, ID: str, hemi: str):
     #   names:  list/array of region names (bytes)
     labels, ctab, names = fsio.read_annot(str(annot_fname))
 
-    # Convert names to plain Python strings
-    struct_names = [n.decode("utf-8") if isinstance(n, (bytes, bytearray)) else str(n)
-                    for n in names]
+    struct_names = [
+        n.decode("utf-8") if isinstance(n, (bytes, bytearray)) else str(n)
+        for n in names
+    ]
 
     return labels, ctab, struct_names
 
@@ -142,44 +143,38 @@ def _process_hemi(
         {hemi}_{region_name}.mat  (variable 'lh_cp_dwi' or 'rh_cp_dwi')
         {hemi}_{region_name}.csv
     """
-    max_index = ori_cp_dwi.shape[1]  # columns
+    max_index = ori_cp_dwi.shape[1]  # number of columns
 
-    # Loop over region rows 2..36 (MATLAB 1-based), i != 5
-    for i in range(2, 37):
+    for i in range(2, 37):  # MATLAB 2:36
         if i == 5:
             continue
 
-        # MATLAB uses colortable.struct_names(i, 1)
-        # Here struct_names is a simple list.
-        # Need to guard against out-of-range if present.
-        if i >= len(struct_names):
-            # If the colortable has fewer entries than 36, skip extras.
+        # MATLAB is 1-based; nibabel arrays are 0-based.
+        # So MATLAB row i corresponds to Python index i-1.
+        row_idx = i - 1
+
+        if row_idx >= len(struct_names) or row_idx >= ctab.shape[0]:
+            # If the color table has fewer entries than expected, skip extras.
             continue
 
-        region_name = struct_names[i]
-        # MATLAB: region_num = colortable.table(i, 5);
-        # nibabel ctab: columns are RGBA + ID in column 4
-        region_num = int(ctab[i, 4])
+        region_name = struct_names[row_idx]
+        # nibabel ctab: RGBA + ID in column 4
+        region_num = int(ctab[row_idx, 4])
 
-        # MATLAB: vertx_num = find(label == region_num);
         vertex_indices = np.where(labels == region_num)[0]  # 0-based
         if vertex_indices.size == 0:
             # No vertices in this region for this subject/hemisphere
             continue
 
-        # Compute 1-based column indices as in MATLAB, then filter and convert to 0-based.
         index_1b = _region_indices_for_vertices(vertex_indices, depth_samples=21)
 
         # Filter out-of-range indices (MATLAB: index(:, any(index > max_index, 1)) = [])
         valid_mask = index_1b <= max_index
         index_1b = index_1b[valid_mask]
-
         if index_1b.size == 0:
             continue
 
-        # Convert to 0-based for NumPy indexing
         idx_0b = index_1b - 1
-
         cp_dwi = ori_cp_dwi[:, idx_0b]
 
         # File naming: 'lh_{region_name}' or 'rh_{region_name}'
@@ -191,8 +186,7 @@ def _process_hemi(
         var_name = f"{hemi}_cp_dwi"
         savemat(mat_path, {var_name: cp_dwi})
 
-        # Save CSV (double-check if you want row-major vs col-major;
-        # this mirrors MATLAB "writematrix" semantics).
+        # Save CSV (mirrors MATLAB writematrix)
         np.savetxt(csv_path, cp_dwi, delimiter=",")
 
 
@@ -200,34 +194,38 @@ def coordinates_in_regions_oneMM_DD(ID: str, input_dir, output_dir):
     """
     Python version of coordinates_in_regions_oneMM_DD(ID, input_dir, output_dir).
 
-    NOTE: input_dir is kept for API compatibility but not used in this function,
-    just like in the MATLAB code you showed.
+    READS from:
+        input_dir / ID / QSM
+        input_dir / ID / ID / label
+
+    WRITES to:
+        output_dir / ID / QSM / label_coord_1mm
     """
-    # Normalize to Path objects
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
 
-    # Equivalent to: mkdir([output_dir ID '/QSM/label_coord_1mm/']);
-    label_coord_dir = output_dir / ID / "QSM" / "label_coord_1mm"
+    data_root = input_dir
+    write_root = output_dir
+
+    # Where to write per-region label coordinate outputs
+    label_coord_dir = write_root / ID / "QSM" / "label_coord_1mm"
     label_coord_dir.mkdir(parents=True, exist_ok=True)
 
-    qsm_dir = input_dir / ID / "QSM"
+    # Where to read QSM columns from
+    qsm_dir = data_root / ID / "QSM"
 
-    # Check required .mat file (_column_lh.mat) exists, as in MATLAB
     col_lh_mat = qsm_dir / f"{ID}_column_lh.mat"
     if not col_lh_mat.is_file():
         print(f"Subject {ID} doesnt have columns result; looked in {col_lh_mat}")
         return
 
-    # Load lh_cp_dwi, rh_cp_dwi
     ori_lh_cp_dwi, ori_rh_cp_dwi = _load_cp_dwi_mats(qsm_dir, ID)
 
-    # Load annotations for lh and rh
-    subject_dir = input_dir / ID / ID  # .../ID/ID/label/lh.aparc.annot
-    labels_lh, ctab_lh, names_lh = _load_aparc_annot(subject_dir, ID, "lh")
-    labels_rh, ctab_rh, names_rh = _load_aparc_annot(subject_dir, ID, "rh")
+    # Where to read annotations from: input_dir / ID / ID / label
+    subject_dir = data_root / ID / ID
+    labels_lh, ctab_lh, names_lh = _load_aparc_annot(subject_dir, "lh")
+    labels_rh, ctab_rh, names_rh = _load_aparc_annot(subject_dir, "rh")
 
-    # Process each hemisphere
     _process_hemi(
         hemi="lh",
         labels=labels_lh,
@@ -249,39 +247,15 @@ def coordinates_in_regions_oneMM_DD(ID: str, input_dir, output_dir):
 
 def _cli():
     """
-    Small command-line interface wrapper so you can call this script directly.
+    Command-line interface wrapper.
 
     Example:
         python coordinates_in_regions_oneMM_DD.py \\
             --ID S00775 \\
-            --input-dir /mnt/newStor/paros/paros_WORK/hanwen/ad_decode_test/output/ \\
-            --output-dir /mnt/newStor/paros/paros_WORK/hanwen/ad_decode_test/output/
+            --input-dir  /mnt/newStor/paros/paros_WORK/hanwen/ad_decode_test/output/ \\
+            --output-dir /mnt/newStor/paros/paros_WORK/column_code_tester/
     """
     parser = argparse.ArgumentParser(
         description="Generate cortical column coordinates in different regions (1mm, DWI)."
     )
-    parser.add_argument("--ID", required=True, help="Subject ID (e.g., S00775)")
-    parser.add_argument(
-        "--input-dir",
-        type=Path,
-        default=Path(
-            "/Volumes/newJetStor/newJetStor/paros/paros_WORK/hanwen/ad_decode_test/output/"
-        ),
-        help="Input directory root (not used directly, kept for compatibility).",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path(
-            "/Volumes/newJetStor/newJetStor/paros/paros_WORK/hanwen/ad_decode_test/output/"
-        ),
-        help="Output directory root (contains ID/QSM and ID/ID/label).",
-    )
-
-    args = parser.parse_args()
-    coordinates_in_regions_oneMM_DD(args.ID, args.input_dir, args.output_dir)
-
-
-if __name__ == "__main__":
-    _cli()
-	
+    parser.add_argument("--_
