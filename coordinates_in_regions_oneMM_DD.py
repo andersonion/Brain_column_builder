@@ -64,6 +64,9 @@ def _load_cp_dwi_mats(qsm_dir: Path, ID: str):
 def _load_aparc_annot(subject_dir: Path, hemi: str):
     """
     Load FreeSurfer aparc annotation for one hemisphere and print basic stats.
+
+    IMPORTANT: In nibabel, 'labels' are *indices* into ctab/names,
+    not the original RGB-coded IDs (ctab[:,4]).
     """
     annot_fname = subject_dir / "label" / f"{hemi}.aparc.annot"
     print(f"\n[ANNOT] Loading {hemi}.aparc.annot from:")
@@ -82,12 +85,7 @@ def _load_aparc_annot(subject_dir: Path, hemi: str):
     unique_labels = np.unique(labels)
     print(f"[ANNOT] {hemi}: labels shape = {labels.shape}, unique labels = {len(unique_labels)}")
     print(f"[ANNOT] {hemi}: struct_names = {len(struct_names)}, ctab rows = {ctab.shape[0]}")
-    print(f"[ANNOT] {hemi}: first 10 unique label IDs: {unique_labels[:10]}")
-
-    # Also print the first few region names and IDs from the colortable
-    print(f"[ANNOT] {hemi}: first 10 colortable entries (name, ID):")
-    for idx in range(min(10, len(struct_names), ctab.shape[0])):
-        print(f"    idx {idx}: name='{struct_names[idx]}', ID={int(ctab[idx, 4])}")
+    print(f"[ANNOT] {hemi}: first 10 unique label indices: {unique_labels[:10]}")
 
     return labels, ctab, struct_names
 
@@ -97,9 +95,11 @@ def _load_aparc_annot(subject_dir: Path, hemi: str):
 def _region_indices_for_vertices(vertex_indices_0b: np.ndarray, depth_samples: int = 21):
     """
     From 0-based vertex indices, compute 1-based depth-sample indices,
-    mirroring the MATLAB math.
+    mirroring the MATLAB math:
+
+        vertx_num (1-based) * 21 + (-20..0)
     """
-    vertx_1b = vertex_indices_0b.astype(np.int64) + 1  # 1-based
+    vertx_1b = vertex_indices_0b.astype(np.int64) + 1  # 1-based vertex indices
     offsets = np.arange(-20, 1, dtype=np.int64)        # -20..0
     indices = []
 
@@ -122,19 +122,18 @@ def _process_hemi(
 ):
     """
     Process one hemisphere, logging per-region QA info.
+
+    NOTE: In nibabel:
+        - 'labels' are indices into 'ctab' / 'struct_names'.
+        - So for row_idx, the corresponding label is exactly 'row_idx'.
     """
     print(f"\n===== PROCESSING {hemi.upper()} HEMISPHERE =====")
     max_index = ori_cp_dwi.shape[1]
     print(f"[{hemi}] cp_dwi columns available: {max_index}")
     print(f"[{hemi}] struct_names length: {len(struct_names)}, ctab rows: {ctab.shape[0]}")
 
-    all_label_ids = set(int(x) for x in np.unique(labels))
-    all_ctab_ids = set(int(x) for x in ctab[:, 4])
-    inter_ids = all_label_ids.intersection(all_ctab_ids)
-
-    print(f"[{hemi}] Unique label IDs in labels: {len(all_label_ids)}")
-    print(f"[{hemi}] Unique IDs in ctab:        {len(all_ctab_ids)}")
-    print(f"[{hemi}] Intersection size:         {len(inter_ids)}")
+    unique_label_indices = np.unique(labels)
+    print(f"[{hemi}] unique label indices (first 20): {unique_label_indices[:20]}")
 
     n_written = 0
     n_regions_with_vertices = 0
@@ -152,20 +151,21 @@ def _process_hemi(
             continue
 
         region_name = struct_names[row_idx]
-        region_num = int(ctab[row_idx, 4])
+        region_id_orig = int(ctab[row_idx, 4])   # original FS ID (informational)
+        region_index = row_idx                   # this is what 'labels' stores in nibabel
 
-        vertex_indices = np.where(labels == region_num)[0]
+        # 🔑 KEY FIX: match on 'region_index' (row_idx), not 'region_id_orig'
+        vertex_indices = np.where(labels == region_index)[0]
         n_vertices = vertex_indices.size
-        present_in_labels = region_num in all_label_ids
 
         print(f"\n[{hemi}] REGION i={i}, row_idx={row_idx}")
-        print(f"    name        = '{region_name}'")
-        print(f"    region_num  = {region_num}")
-        print(f"    in_labels   = {present_in_labels}")
-        print(f"    n_vertices  = {n_vertices}")
+        print(f"    name          = '{region_name}'")
+        print(f"    region_index  = {region_index} (matches 'labels')")
+        print(f"    region_id_orig= {region_id_orig} (ctab[:,4])")
+        print(f"    n_vertices    = {n_vertices}")
 
         if n_vertices == 0:
-            print(f"    -> No vertices with label {region_num}, skipping region.")
+            print(f"    -> No vertices with label index {region_index}, skipping region.")
             continue
 
         n_regions_with_vertices += 1
