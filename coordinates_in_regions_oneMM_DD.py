@@ -1,441 +1,412 @@
 #!/usr/bin/env python
 
 """
-get_columns_in_regions_oneMM_DD.py
+Verbose QA version of coordinates_in_regions_oneMM_DD.
 
-- No hardcoded 'QSM' anywhere.
-- Supports arbitrary contrasts, via --contrast.
-- Expects:
-    <input_dir>/<ID>/<ID>_<contrast>_masked.nii.gz
-    <output_dir>/<ID>/<contrast>/label_coord_1mm/*.mat
+Features:
+- Contrast as CLI arg (default: QSM)
+- Skips regions whose outputs already exist (unless --force)
+- Checksum-based skip: if inputs/code change, existing outputs are treated as stale
+- Thread-based parallel execution per hemisphere via --nproc
 
-- Produces:
-    Per-column values:
-        <output_dir>/<ID>/<contrast>/<contrast>_cols_by_column/
-            <ID>_lh_<region>_cols_<contrast>.csv
-            <ID>_rh_<region>_cols_<contrast>.csv
-            <ID>_cols_<contrast>_summary.csv
-
-    Region-mean depth profiles (21×1):
-        <output_dir>/<ID>/<contrast>/<contrast>_cols_region_mean/
-            <ID>_lh_<region>_cols_<contrast}_mean.csv
-            <ID>_rh_<region>_cols_<contrast}_mean.csv
-
-    QA plots and line-profile CI CSV:
-        <output_dir>/<ID>/<contrast>/plots_QA/
-            <ID>_lh_<region>_profile_<contrast>.png
-            <ID>_rh_<region>_profile_<contrast>.png
-            <ID>_profiles_QA_<contrast>.csv
+Usage:
+    python coordinates_in_regions_oneMM_DD.py \
+        --ID S00775 \
+        --input-dir  /mnt/newStor/paros/paros_WORK/hanwen/ad_decode_test/output/ \
+        --output-dir /mnt/newStor/paros/paros_WORK/column_code_tester/ \
+        --contrast QSM \
+        --nproc 4
 """
 
 import argparse
+import hashlib
 from pathlib import Path
-import csv
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import nibabel as nib
-from scipy.io import loadmat
-from scipy.ndimage import map_coordinates
-import matplotlib.pyplot as plt
+from scipy.io import loadmat, savemat
+import nibabel.freesurfer as fsio
 
 
-import hashlib
-
-PIPELINE_VERSION = "get_columns_v1.0_20251125"
+PIPELINE_VERSION = "column_coords_v1.1_20251125"
 
 
-def _region_checksum(ID: str, contrast: str, region: str) -> str:
-    """Return a stable checksum string for one region's config.
+# ------------------ LOW-LEVEL LOADERS ------------------ #
 
-    Currently based on pipeline version, subject ID, contrast name, and region name.
-    If you change processing logic in a way that invalidates old outputs,
-    bump PIPELINE_VERSION to force recompute.
+def _load_cp_dwi_mats(contrast_dir: Path, ID: str):
+    """Load *_column_* DWI coordinate matrices and print shapes."""
+    lh_mat = contrast_dir / f"{ID}_column_lh.mat"
+    rh_mat = contrast_dir / f"{ID}_column_rh.mat"
+    lh_dwi_mat = contrast_dir / f"{ID}_column_lh_dwi.mat"
+    rh_dwi_mat = contrast_dir / f"{ID}_column_rh_dwi.mat"
+
+    print("\n[LOAD] column dir:", contrast_dir)
+    print("[LOAD] Expecting:")
+    print(f"  {lh_mat}")
+    print(f"  {rh_mat}")
+    print(f"  {lh_dwi_mat}")
+    print(f"  {rh_dwi_mat}")
+
+    if not lh_dwi_mat.is_file():
+        raise FileNotFoundError(f"Missing required: {lh_dwi_mat}")
+    if not rh_dwi_mat.is_file():
+        raise FileNotFoundError(f"Missing required: {rh_dwi_mat}")
+
+    if lh_mat.is_file():
+        _ = loadmat(lh_mat)
+    if rh_mat.is_file():
+        _ = loadmat(rh_mat)
+
+    lh_dwi = loadmat(lh_dwi_mat)
+    rh_dwi = loadmat(rh_dwi_mat)
+
+    if "lh_cp_dwi" not in lh_dwi:
+        raise KeyError(f"{lh_dwi_mat} missing 'lh_cp_dwi'")
+    if "rh_cp_dwi" not in rh_dwi:
+        raise KeyError(f"{rh_dwi_mat} missing 'rh_cp_dwi'")
+
+    ori_lh_cp_dwi = np.asarray(lh_dwi["lh_cp_dwi"])
+    ori_rh_cp_dwi = np.asarray(rh_dwi["rh_cp_dwi"])
+
+    print(f"[LOAD] LH cp_dwi shape: {ori_lh_cp_dwi.shape}")
+    print(f"[LOAD] RH cp_dwi shape: {ori_rh_cp_dwi.shape}")
+
+    return ori_lh_cp_dwi, ori_rh_cp_dwi
+
+
+def _load_aparc_annot(subject_dir: Path, hemi: str):
+    """Load FreeSurfer aparc annotation and print stats."""
+    annot_fname = subject_dir / "label" / f"{hemi}.aparc.annot"
+    print(f"\n[ANNOT] Loading {hemi}.aparc.annot from:\n        {annot_fname}")
+
+    if not annot_fname.is_file():
+        raise FileNotFoundError(f"Missing annotation: {annot_fname}")
+
+    labels, ctab, names = fsio.read_annot(str(annot_fname))
+
+    struct_names = [
+        n.decode("utf-8") if isinstance(n, (bytes, bytearray)) else str(n)
+        for n in names
+    ]
+
+    print(f"[ANNOT] {hemi}: labels={labels.shape}, unique={len(np.unique(labels))}")
+    print(f"[ANNOT] {hemi}: struct_names={len(struct_names)}, ctab rows={ctab.shape[0]}")
+    print(f"[ANNOT] {hemi}: first names: {struct_names[:5]}")
+
+    return labels, ctab, struct_names
+
+
+def _region_indices_for_vertices(vertex_indices: np.ndarray) -> np.ndarray:
     """
+    Given vertex indices (0-based), produce 1-based "depth indices" into cp_dwi columns.
+    """
+    if vertex_indices.size == 0:
+        return np.array([], dtype=int)
+
+    depths = np.arange(48, dtype=int)   # 0..47
+    depth_indices = depths + 48         # 48..95
+
+    repeated = np.tile(depth_indices[:, None], (1, vertex_indices.size))
+    index_1b = repeated.flatten(order="F")
+
+    return index_1b
+
+
+# ------------------ CHECKSUM UTILITIES ------------------ #
+
+def _compute_hemi_checksum(
+    hemi: str,
+    labels: np.ndarray,
+    ctab: np.ndarray,
+    struct_names: list[str],
+    ori_cp_dwi: np.ndarray,
+) -> str:
+    """Compute a SHA256 checksum for all inputs relevant to one hemisphere."""
     h = hashlib.sha256()
     h.update(PIPELINE_VERSION.encode("utf-8"))
-    h.update(ID.encode("utf-8"))
-    h.update(contrast.encode("utf-8"))
-    h.update(region.encode("utf-8"))
+    h.update(hemi.encode("utf-8"))
+    h.update(labels.tobytes())
+    h.update(ctab.tobytes())
+    joined_names = "\n".join(struct_names).encode("utf-8")
+    h.update(joined_names)
+    h.update(ori_cp_dwi.tobytes())
     return h.hexdigest()
 
 
-REGION_LIST = [
-    "bankssts",
-    "caudalanteriorcingulate",
-    "caudalmiddlefrontal",
-    "cuneus",
-    "entorhinal",
-    "fusiform",
-    "inferiorparietal",
-    "inferiortemporal",
-    "isthmuscingulate",
-    "lateraloccipital",
-    "lateralorbitofrontal",
-    "lingual",
-    "medialorbitofrontal",
-    "middletemporal",
-    "parahippocampal",
-    "paracentral",
-    "parsopercularis",
-    "parsorbitalis",
-    "parstriangularis",
-    "pericalcarine",
-    "postcentral",
-    "posteriorcingulate",
-    "precentral",
-    "precuneus",
-    "rostralanteriorcingulate",
-    "rostralmiddlefrontal",
-    "superiorfrontal",
-    "superiorparietal",
-    "superiortemporal",
-    "supramarginal",
-    "frontalpole",
-    "temporalpole",
-    "transversetemporal",
-    "insula",
-]
+# ------------------ PER-REGION PROCESSING (POSSIBLY PARALLEL) ------------------ #
 
-
-# ---------------- IMAGE LOADING ---------------- #
-
-def _load_contrast_image(input_dir: Path, ID: str, contrast: str) -> np.ndarray:
-    image_path = input_dir / ID / f"{ID}_{contrast}_masked.nii.gz"
-    print(f"[IMG] Looking for <{contrast}> image at: {image_path}")
-
-    if not image_path.is_file():
-        raise FileNotFoundError(f"Missing masked {contrast} image: {image_path}")
-
-    img = nib.load(str(image_path))
-    vol = img.get_fdata()
-
-    if vol.ndim == 4:
-        vol = vol[..., 0]
-
-    print(f"[IMG] Loaded volume: shape {vol.shape}")
-    return vol
-
-
-# ---------------- COORDS LOADING ---------------- #
-
-def _load_region_cp_dwi(mat_path: Path, hemi: str) -> np.ndarray:
-    """
-    Load cp_dwi for a single region/hemisphere.
-
-    mat_path: lh_<region>.mat or rh_<region>.mat
-    hemi: "lh" or "rh"
-    """
-    data = loadmat(mat_path)
-    key_candidates = [
-        f"{hemi}_cp_dwi",
-        "cp_dwi",
-    ]
-
-    for key in key_candidates:
-        if key in data:
-            cp = np.asarray(data[key])
-            print(f"[MAT] Loaded {key} from {mat_path.name} with shape {cp.shape}")
-            return cp
-
-    raise KeyError(
-        f"None of {key_candidates} found in {mat_path.name}. Keys: {list(data.keys())}"
-    )
-
-
-# --------------- SAMPLING ALONG COLUMNS ----------------- #
-
-def _sample_columns(
-    vol: np.ndarray,
-    cp_dwi: np.ndarray,
-    points_num: int,
-) -> np.ndarray:
-    """
-    Sample volume at coordinates in cp_dwi.
-
-    cp_dwi: shape (4, N_coords), first three rows are x,y,z (1-based).
-    Returns: values shape (N_columns, points_num).
-    """
-    n_coords = cp_dwi.shape[1]
-
-    if n_coords % points_num != 0:
-        raise ValueError(f"Invalid cp_dwi size {n_coords} for points_num {points_num}")
-
-    columns = n_coords // points_num
-    print(f"[SAMPLE] columns={columns}, depths={points_num}")
-
-    vals = np.zeros((columns, points_num), float)
-
-    for d in range(points_num):
-        idx = d + np.arange(columns) * points_num
-
-        coords = cp_dwi[0:3, idx].astype(float)
-        coords -= 1.0  # MATLAB → Python indexing
-
-        sampled = map_coordinates(
-            vol, coords, order=1, mode="nearest"
-        )
-        vals[:, d] = sampled
-
-    return vals
-
-
-# --------------- QA HELPERS ----------------- #
-
-def _compute_mean_and_ci(
-    vals: np.ndarray,
-    ci_level: float = 0.95,
+def _process_single_region(
+    i: int,
+    hemi: str,
+    labels: np.ndarray,
+    ctab: np.ndarray,
+    struct_names: list[str],
+    ori_cp_dwi: np.ndarray,
+    out_dir: Path,
+    max_index: int,
+    skip_existing_ok: bool,
+    force: bool,
 ):
     """
-    vals: (N_columns, N_depths)
+    Process a single region index i.
     Returns:
-        mean: (N_depths,)
-        ci_low: (N_depths,)
-        ci_high: (N_depths,)
-        n_columns: int
+        (files_written, regions_with_vertices, skipped_messages_list)
     """
-    if vals.size == 0:
-        raise ValueError("Empty vals in _compute_mean_and_ci")
+    skipped_msgs = []
+    files_written = 0
+    regions_with_vertices = 0
 
-    n_cols = vals.shape[0]
-    mean = vals.mean(axis=0)
+    row_idx = i - 1
+    region_name = struct_names[row_idx] if 0 <= row_idx < len(struct_names) else None
 
-    # two-sided normal CI
-    from scipy.stats import norm
+    # MATLAB hard-coded skip
+    if i == 5:
+        msg = f"{hemi} i={i}, row_idx={row_idx}, region={region_name or '<unknown>'}: MATLAB skip (i=5)"
+        print(f"[{hemi}] {msg}")
+        skipped_msgs.append(msg)
+        return files_written, regions_with_vertices, skipped_msgs
 
-    z = norm.ppf(0.5 + ci_level / 2.0)
-    std = vals.std(axis=0, ddof=1)
-    sem = std / np.sqrt(n_cols)
+    if row_idx >= len(struct_names) or row_idx >= ctab.shape[0]:
+        msg = f"{hemi} i={i}, row_idx={row_idx}: out of bounds for struct_names/ctab → skip"
+        print(f"[{hemi}] {msg}")
+        skipped_msgs.append(msg)
+        return files_written, regions_with_vertices, skipped_msgs
 
-    ci_low = mean - z * sem
-    ci_high = mean + z * sem
-    return mean, ci_low, ci_high, n_cols
+    region_index = row_idx
+    region_id_orig = int(ctab[row_idx, 4])
+
+    vertex_indices = np.where(labels == region_index)[0]
+    n_vertices = vertex_indices.size
+
+    print(f"\n[{hemi}] REGION i={i}, row_idx={row_idx}")
+    print(f"    name          = '{region_name}'")
+    print(f"    region_index  = {region_index} (labels index)")
+    print(f"    region_id_orig= {region_id_orig} (ctab[:,4])")
+    print(f"    n_vertices    = {n_vertices}")
+
+    if n_vertices == 0:
+        msg = (
+            f"{hemi} region '{region_name}' (i={i}, index={region_index}): "
+            "no vertices with this label index → skip"
+        )
+        print(f"    -> {msg}")
+        skipped_msgs.append(msg)
+        return files_written, regions_with_vertices, skipped_msgs
+
+    regions_with_vertices = 1
+
+    output_name = f"{hemi}_{region_name}"
+    mat_path = out_dir / f"{output_name}.mat"
+    csv_path = out_dir / f"{output_name}.csv"
+
+    # Skip if outputs exist and we trust them (skip_existing_ok == True)
+    if skip_existing_ok and mat_path.is_file() and csv_path.is_file():
+        msg = f"{hemi} region '{region_name}' (i={i}): output exists and checksum OK → skipping"
+        print(f"    -> {msg}")
+        skipped_msgs.append(msg)
+        return files_written, regions_with_vertices, skipped_msgs
+
+    if force:
+        print("    -> FORCE recompute")
+
+    # Compute depth indices
+    index_1b = _region_indices_for_vertices(vertex_indices)
+    valid_mask = index_1b <= max_index
+    index_1b = index_1b[valid_mask]
+
+    print(f"    depth indices kept = {index_1b.size} (after clipping > max_index)")
+
+    if index_1b.size == 0:
+        msg = (
+            f"{hemi} region '{region_name}' (i={i}, index={region_index}): "
+            "no valid depth indices after clipping → skip"
+        )
+        print(f"    -> {msg}")
+        skipped_msgs.append(msg)
+        return files_written, regions_with_vertices, skipped_msgs
+
+    idx_0b = index_1b - 1
+    cp_dwi = ori_cp_dwi[:, idx_0b]
+
+    savemat(mat_path, {f"{hemi}_cp_dwi": cp_dwi})
+    np.savetxt(csv_path, cp_dwi, delimiter=",")
+
+    print(f"    -> WROTE {mat_path.name}, {csv_path.name}")
+    files_written = 1
+
+    return files_written, regions_with_vertices, skipped_msgs
 
 
-def _plot_profile_with_ci(
-    depth_indices: np.ndarray,
-    mean: np.ndarray,
-    ci_low: np.ndarray,
-    ci_high: np.ndarray,
-    out_path: Path,
-    title: str,
-    contrast: str,
+# ------------------ CORE PER-HEMI PROCESSING ------------------ #
+
+def _process_hemi(
+    hemi: str,
+    labels: np.ndarray,
+    ctab: np.ndarray,
+    struct_names: list[str],
+    ori_cp_dwi: np.ndarray,
+    out_dir: Path,
+    force: bool = False,
+    nproc: int = 1,
 ):
-    """
-    Save a PNG of the depth profile with shaded CI.
-    """
-    fig, ax = plt.subplots()
-    ax.plot(depth_indices, mean)
-    ax.fill_between(depth_indices, ci_low, ci_high, alpha=0.3)
+    print(f"\n===== PROCESSING {hemi.upper()} HEMISPHERE =====")
+    max_index = ori_cp_dwi.shape[1]
 
-    ax.set_xlabel("Depth index")
-    ax.set_ylabel(f"{contrast} intensity")
-    ax.set_title(title)
+    # ---- Checksum logic ----
+    checksum_path = out_dir / f"{hemi}_inputs.sha256"
+    current_checksum = _compute_hemi_checksum(hemi, labels, ctab, struct_names, ori_cp_dwi)
+    previous_checksum = None
+    inputs_changed = False
 
-    fig.tight_layout()
-    fig.savefig(out_path)
-    plt.close(fig)
+    if checksum_path.is_file():
+        try:
+            previous_checksum = checksum_path.read_text().strip()
+            if previous_checksum != current_checksum:
+                inputs_changed = True
+        except Exception as e:
+            print(f"[{hemi}] WARNING: Failed to read previous checksum: {e}")
+            inputs_changed = True
+    else:
+        inputs_changed = True  # no checksum yet → treat as "new"
+
+    if inputs_changed:
+        print(f"[{hemi}] INPUTS OR CODE CHANGED (checksum mismatch or missing).")
+        print(f"[{hemi}] Existing outputs will NOT be trusted; recomputing regions as needed.")
+    else:
+        print(f"[{hemi}] Checksum matches. Existing outputs considered up-to-date.")
+
+    # Write (or overwrite) checksum file with current value
+    try:
+        checksum_path.write_text(current_checksum + "\n")
+    except Exception as e:
+        print(f"[{hemi}] WARNING: could not write checksum file: {e}")
+
+    # skip_existing_ok means we are allowed to skip based on existing files.
+    skip_existing_ok = (not force) and (not inputs_changed)
+
+    # ---- Parallel region processing ----
+    region_indices = [i for i in range(2, 37)]  # MATLAB: 2..36
+    total_files_written = 0
+    total_regions_with_vertices = 0
+    all_skipped_msgs = []
+
+    def _task(i):
+        return _process_single_region(
+            i=i,
+            hemi=hemi,
+            labels=labels,
+            ctab=ctab,
+            struct_names=struct_names,
+            ori_cp_dwi=ori_cp_dwi,
+            out_dir=out_dir,
+            max_index=max_index,
+            skip_existing_ok=skip_existing_ok,
+            force=force,
+        )
+
+    if nproc is None or nproc < 1:
+        nproc = 1
+
+    if nproc == 1:
+        for i in region_indices:
+            files_written, regions_with_vertices, skipped_msgs = _task(i)
+            total_files_written += files_written
+            total_regions_with_vertices += regions_with_vertices
+            all_skipped_msgs.extend(skipped_msgs)
+    else:
+        print(f"[{hemi}] Running with nproc={nproc} (thread-based parallelism)")
+        with ThreadPoolExecutor(max_workers=nproc) as ex:
+            for files_written, regions_with_vertices, skipped_msgs in ex.map(_task, region_indices):
+                total_files_written += files_written
+                total_regions_with_vertices += regions_with_vertices
+                all_skipped_msgs.extend(skipped_msgs)
+
+    # ---- Summary ----
+    print(f"\n>>> SUMMARY {hemi.upper()} <<<")
+    print(f"    Files written this run:   {total_files_written}")
+    print(f"    Regions with vertices:    {total_regions_with_vertices}")
+    print(f"    Output dir:               {out_dir}")
+
+    print(f"\n>>> {hemi.upper()} REGIONS SKIPPED / NOT WRITTEN <<<")
+    if all_skipped_msgs:
+        for msg in all_skipped_msgs:
+            print("    -", msg)
+    else:
+        print("    None.")
 
 
-# ---------------- MAIN ---------------- #
+# ------------------ TOP-LEVEL FUNCTION ------------------ #
 
-def get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir, contrast, force=False):
-
+def coordinates_in_regions_oneMM_DD(
+    ID: str,
+    input_dir,
+    output_dir,
+    contrast: str = "QSM",
+    force: bool = False,
+    nproc: int = 1,
+):
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
 
-    print(f"\n[INFO] Running for subject {ID}")
-    print(f"[INFO] Contrast: {contrast}")
-    print(f"[INFO] I/O roots:")
-    print(f"    input_dir:  {input_dir}")
-    print(f"    output_dir: {output_dir}")
+    contrast_dir = input_dir / ID / contrast
+    subject_dir = input_dir / ID / ID
+    out_dir = output_dir / ID / contrast / "label_coord_1mm"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[INFO] Pipeline version: {PIPELINE_VERSION}")
-    print(f"[INFO] FORCE mode: {force}")
+    print("\n[PATH] -------")
+    print("[PATH] Subject ID:         ", ID)
+    print("[PATH] Input dir:          ", input_dir)
+    print("[PATH] Contrast:           ", contrast)
+    print("[PATH] Column dir:         ", contrast_dir)
+    print("[PATH] Subject dir (labels)", subject_dir)
+    print("[PATH] Output dir:         ", out_dir)
+    print("[PATH] FORCE mode:         ", force)
+    print("[PATH] nproc (per hemi):   ", nproc)
+    print("[PATH] Pipeline version:   ", PIPELINE_VERSION)
 
-    # load MRI contrast
-    vol = _load_contrast_image(input_dir, ID, contrast)
+    ori_lh_cp_dwi, ori_rh_cp_dwi = _load_cp_dwi_mats(contrast_dir, ID)
 
-    # expected label coord folder from script 1
-    label_coord_dir = output_dir / ID / contrast / "label_coord_1mm"
-    if not label_coord_dir.is_dir():
-        raise FileNotFoundError(f"Missing label_coord_1mm in: {label_coord_dir}")
+    labels_lh, ctab_lh, names_lh = _load_aparc_annot(subject_dir, "lh")
+    labels_rh, ctab_rh, names_rh = _load_aparc_annot(subject_dir, "rh")
 
-    contrast_dir = output_dir / ID / contrast
-
-    per_column_dir = contrast_dir / f"{contrast}_cols_by_column"
-    per_mean_dir = contrast_dir / f"{contrast}_cols_region_mean"
-    qa_dir = contrast_dir / "plots_QA"
-
-    per_column_dir.mkdir(parents=True, exist_ok=True)
-    per_mean_dir.mkdir(parents=True, exist_ok=True)
-    qa_dir.mkdir(parents=True, exist_ok=True)
-
-    points_num = 21
-    depth_indices = np.arange(points_num)
-
-    summary = []       # for per-column summary CSV
-    qa_rows = []       # for QA profiles CSV (all regions)
-
-    # loop over regions
-    for region in REGION_LIST:
-        print(f"\n[REGION] {region}")
-
-        lh_mat = label_coord_dir / f"lh_{region}.mat"
-        rh_mat = label_coord_dir / f"rh_{region}.mat"
-
-        if not lh_mat.is_file() or not rh_mat.is_file():
-            print(f"  -> missing lh/rh coord files, skipping region")
-            continue
-
-        # expected per-region outputs
-        lh_path = per_column_dir / f"{ID}_lh_{region}_cols_{contrast}.csv"
-        rh_path = per_column_dir / f"{ID}_rh_{region}_cols_{contrast}.csv"
-        lh_mean_path = per_mean_dir / f"{ID}_lh_{region}_cols_{contrast}_mean.csv"
-        rh_mean_path = per_mean_dir / f"{ID}_rh_{region}_cols_{contrast}_mean.csv"
-        lh_png_path = qa_dir / f"{ID}_lh_{region}_profile_{contrast}.png"
-        rh_png_path = qa_dir / f"{ID}_rh_{region}_profile_{contrast}.png"
-        checksum_path = qa_dir / f"{ID}_{region}_cols_{contrast}.sha256"
-
-        outputs_exist = (
-            lh_path.is_file()
-            and rh_path.is_file()
-            and lh_mean_path.is_file()
-            and rh_mean_path.is_file()
-            and lh_png_path.is_file()
-            and rh_png_path.is_file()
-        )
-
-        checksum_ok = False
-        if checksum_path.is_file():
-            try:
-                stored = checksum_path.read_text().strip()
-                expected = _region_checksum(ID, contrast, region)
-                if stored == expected:
-                    checksum_ok = True
-            except Exception as e:
-                print(f"  [WARN] could not read checksum for region {region}: {e}")
-
-        if (not force) and outputs_exist and checksum_ok:
-            print("  -> outputs + checksum present; skipping recompute for this region")
-            continue
-        elif force:
-            print("  -> FORCE recompute for this region")
-        else:
-            if outputs_exist and not checksum_ok:
-                print("  -> outputs exist but checksum missing/mismatch; recomputing region")
-            else:
-                print("  -> outputs missing; computing region")
-
-        # coord matrices
-        lh_cp = _load_region_cp_dwi(lh_mat, "lh")
-        rh_cp = _load_region_cp_dwi(rh_mat, "rh")
-
-        # sample
-        lh_vals = _sample_columns(vol, lh_cp, points_num)
-        rh_vals = _sample_columns(vol, rh_cp, points_num)
-
-        # --------- save per-column output ---------
-        np.savetxt(lh_path, lh_vals, delimiter=",")
-        np.savetxt(rh_path, rh_vals, delimiter=",")
-
-        print(f"  -> LH per-column saved ({lh_vals.shape}) → {lh_path}")
-        print(f"  -> RH per-column saved ({rh_vals.shape}) → {rh_path}")
-
-        summary.append(["lh", region, lh_vals.shape[0], lh_vals.shape[1], lh_path.name])
-        summary.append(["rh", region, rh_vals.shape[0], rh_vals.shape[1], rh_path.name])
-
-        # --------- region mean depth profile (21×1 CSV) ---------
-        lh_mean_profile = lh_vals.mean(axis=0).reshape(-1, 1)
-        rh_mean_profile = rh_vals.mean(axis=0).reshape(-1, 1)
-
-        np.savetxt(lh_mean_path, lh_mean_profile, delimiter=",")
-        np.savetxt(rh_mean_path, rh_mean_profile, delimiter=",")
-
-        print(f"  -> LH depth-mean saved (21×1) → {lh_mean_path}")
-        print(f"  -> RH depth-mean saved (21×1) → {rh_mean_path}")
-
-        # --------- QA: mean + CI + plots ---------
-        # LH
-        lh_mean, lh_ci_low, lh_ci_high, lh_n = _compute_mean_and_ci(lh_vals, ci_level=0.95)
-        lh_png_path = qa_dir / f"{ID}_lh_{region}_profile_{contrast}.png"
-        _plot_profile_with_ci(
-            depth_indices,
-            lh_mean,
-            lh_ci_low,
-            lh_ci_high,
-            lh_png_path,
-            title=f"{ID} lh {region} ({contrast})",
-            contrast=contrast,
-        )
-        print(f"  -> LH QA plot saved → {lh_png_path}")
-
-        for d_idx, m, lo, hi in zip(depth_indices, lh_mean, lh_ci_low, lh_ci_high):
-            qa_rows.append(["lh", region, int(d_idx), float(m), float(lo), float(hi), int(lh_n)])
-
-        # RH
-        rh_mean, rh_ci_low, rh_ci_high, rh_n = _compute_mean_and_ci(rh_vals, ci_level=0.95)
-        rh_png_path = qa_dir / f"{ID}_rh_{region}_profile_{contrast}.png"
-        _plot_profile_with_ci(
-            depth_indices,
-            rh_mean,
-            rh_ci_low,
-            rh_ci_high,
-            rh_png_path,
-            title=f"{ID} rh {region} ({contrast})",
-            contrast=contrast,
-        )
-        print(f"  -> RH QA plot saved → {rh_png_path}")
-
-        # --------- region checksum marker ---------
-        try:
-            checksum = _region_checksum(ID, contrast, region)
-            checksum_path.write_text(checksum + "\n")
-        except Exception as e:
-            print(f"  [WARN] could not write checksum for region {region}: {e}")
-
-        for d_idx, m, lo, hi in zip(depth_indices, rh_mean, rh_ci_low, rh_ci_high):
-            qa_rows.append(["rh", region, int(d_idx), float(m), float(lo), float(hi), int(rh_n)])
-
-    # --------- per-column summary CSV ---------
-    if summary:
-        summary_path = per_column_dir / f"{ID}_cols_{contrast}_summary.csv"
-        with open(summary_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["hemi", "region", "n_columns", "n_depths", "csv_file"])
-            writer.writerows(summary)
-        print(f"\n[SUMMARY] wrote per-column summary: {summary_path}")
-    else:
-        print("\n[SUMMARY] no regions processed for per-column summary.")
-
-    # --------- QA profiles CSV (all regions) ---------
-    if qa_rows:
-        qa_csv_path = qa_dir / f"{ID}_profiles_QA_{contrast}.csv"
-        with open(qa_csv_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                ["hemi", "region", "depth_index", "mean", "ci_lower", "ci_upper", "n_columns"]
-            )
-            writer.writerows(qa_rows)
-        print(f"[QA] wrote profile CI CSV: {qa_csv_path}")
-    else:
-        print("[QA] no QA rows generated; QA CSV not written.")
+    _process_hemi("lh", labels_lh, ctab_lh, names_lh, ori_lh_cp_dwi, out_dir, force, nproc)
+    _process_hemi("rh", labels_rh, ctab_rh, names_rh, ori_rh_cp_dwi, out_dir, force, nproc)
 
 
-# ---------------- CLI ---------------- #
+# ------------------ CLI ENTRY ------------------ #
 
 def _cli():
-    p = argparse.ArgumentParser(
-        description="Sample MRI contrast along cortical columns and generate QA outputs."
+    parser = argparse.ArgumentParser(
+        description="Verbose QA cortical column region extraction."
     )
-    p.add_argument("--ID", required=True, help="Subject ID, e.g. S00775")
-    p.add_argument("--input-dir", required=True, help="Root containing <ID>/<ID>_<contrast>_masked.nii.gz")
-    p.add_argument("--output-dir", required=True, help="Root for <ID>/<contrast>/...")
-    p.add_argument("--contrast", required=True, help="Contrast name, e.g. QSM, T1, FA, MD")
-    p.add_argument("--force", action="store_true", help="Recompute regions even if outputs + checksum exist.")
-    args = p.parse_args()
+    parser.add_argument("--ID", required=True, help="Subject ID (e.g. S00775)")
+    parser.add_argument("--input-dir", required=True, help="Input root dir")
+    parser.add_argument("--output-dir", required=True, help="Output root dir")
+    parser.add_argument(
+        "--contrast",
+        default="QSM",
+        help="Contrast subfolder under ID containing *_column_* files (e.g. QSM, MD, FA).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompute all regions even when outputs + checksum exist.",
+    )
+    parser.add_argument(
+        "--nproc",
+        type=int,
+        default=1,
+        help="Number of parallel worker threads per hemisphere.",
+    )
+    args = parser.parse_args()
 
-    get_columns_in_regions_oneMM_DD(
-        args.ID, args.input_dir, args.output_dir, args.contrast, force=args.force
+    coordinates_in_regions_oneMM_DD(
+        ID=args.ID,
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        contrast=args.contrast,
+        force=args.force,
+        nproc=args.nproc,
     )
 
 
