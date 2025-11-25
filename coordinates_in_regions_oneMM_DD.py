@@ -35,10 +35,10 @@ def _load_cp_dwi_mats(qsm_dir: Path, ID: str):
     Load the *_column_* DWI coordinate matrices.
 
     MATLAB:
-        load([output_dir ID '/QSM/' ID '_column_lh.mat']);
-        load([output_dir ID '/QSM/' ID '_column_rh.mat']);
-        load([output_dir ID '/QSM/' ID '_column_lh_dwi.mat']);
-        load([output_dir ID '/QSM/' ID '_column_rh_dwi.mat']);
+        load([input_dir ID '/QSM/' ID '_column_lh.mat']);
+        load([input_dir ID '/QSM/' ID '_column_rh.mat']);
+        load([input_dir ID '/QSM/' ID '_column_lh_dwi.mat']);
+        load([input_dir ID '/QSM/' ID '_column_rh_dwi.mat']);
 
     In practice, we only need lh_cp_dwi and rh_cp_dwi (DWI space),
     but we mirror the original loads for completeness.
@@ -80,7 +80,7 @@ def _load_aparc_annot(subject_dir: Path, ID: str, hemi: str):
 
     MATLAB equivalent:
         annot_file_lh = 'lh.aparc.annot';
-        file_name_lh = [output_dir ID '/' ID '/label/' annot_file_lh];
+        file_name_lh = [input_dir ID '/' ID '/label/' annot_file_lh];
         [~, label_lh, colortable_lh] = read_annotation(file_name_lh);
     """
     annot_fname = subject_dir / "label" / f"{hemi}.aparc.annot"
@@ -223,7 +223,7 @@ def coordinates_in_regions_oneMM_DD(ID: str, input_dir, output_dir):
     ori_lh_cp_dwi, ori_rh_cp_dwi = _load_cp_dwi_mats(qsm_dir, ID)
 
     # Load annotations for lh and rh
-    subject_dir = output_dir / ID / ID  # .../ID/ID/label/lh.aparc.annot
+    subject_dir = input_dir / ID / ID  # .../ID/ID/label/lh.aparc.annot
     labels_lh, ctab_lh, names_lh = _load_aparc_annot(subject_dir, ID, "lh")
     labels_rh, ctab_rh, names_rh = _load_aparc_annot(subject_dir, ID, "rh")
 
