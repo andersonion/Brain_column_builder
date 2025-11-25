@@ -13,6 +13,13 @@ This script:
   vertices in that region, across 21 "depth" samples per vertex.
 - Saves per-region lh/rh coordinates as both .mat and .csv.
 
+READS from:
+    input_dir / ID / QSM
+    input_dir / ID / ID / label
+
+WRITES to:
+    output_dir / ID / QSM / label_coord_1mm
+
 Dependencies:
     numpy
     scipy (scipy.io.loadmat, scipy.io.savemat)
@@ -36,9 +43,6 @@ def _load_cp_dwi_mats(qsm_dir: Path, ID: str):
         load([input_dir ID '/QSM/' ID '_column_rh.mat']);
         load([input_dir ID '/QSM/' ID '_column_lh_dwi.mat']);
         load([input_dir ID '/QSM/' ID '_column_rh_dwi.mat']);
-
-    In practice, we only need lh_cp_dwi and rh_cp_dwi (DWI space),
-    but we mirror the original loads for completeness.
     """
     lh_mat = qsm_dir / f"{ID}_column_lh.mat"
     rh_mat = qsm_dir / f"{ID}_column_rh.mat"
@@ -50,7 +54,7 @@ def _load_cp_dwi_mats(qsm_dir: Path, ID: str):
     if not rh_dwi_mat.is_file():
         raise FileNotFoundError(f"Missing required file: {rh_dwi_mat}")
 
-    # These two are loaded in MATLAB; we do the same even if we don't use them directly.
+    # These two are loaded in MATLAB; we mirror that, even if unused here.
     if lh_mat.is_file():
         _ = loadmat(lh_mat)
     if rh_mat.is_file():
@@ -59,8 +63,6 @@ def _load_cp_dwi_mats(qsm_dir: Path, ID: str):
     lh_dwi = loadmat(lh_dwi_mat)
     rh_dwi = loadmat(rh_dwi_mat)
 
-    # Expect variables named exactly as in MATLAB:
-    #   lh_cp_dwi, rh_cp_dwi
     try:
         ori_lh_cp_dwi = np.asarray(lh_dwi["lh_cp_dwi"])
     except KeyError as e:
@@ -88,10 +90,6 @@ def _load_aparc_annot(subject_dir: Path, hemi: str):
     if not annot_fname.is_file():
         raise FileNotFoundError(f"Annotation file not found: {annot_fname}")
 
-    # nibabel.freesurfer.read_annot returns:
-    #   labels: (N,) int array (per-vertex label ID)
-    #   ctab:   (K, 5) array (RGBA + ID)
-    #   names:  list/array of region names (bytes)
     labels, ctab, names = fsio.read_annot(str(annot_fname))
 
     struct_names = [
@@ -110,21 +108,18 @@ def _region_indices_for_vertices(vertex_indices_0based: np.ndarray, depth_sample
         index = vertx_num .* 21 + (-20:1:0);        % m x 21
         index = reshape(index', 1, []);             % 1 x (m*21)
 
-    where vertx_num is 1-based vertex indices, and we want final column indices
-    (still 1-based in MATLAB). We return 1-based indices here to mirror MATLAB,
-    and the caller can convert to 0-based for NumPy indexing.
+    We take 0-based vertex_indices, convert to 1-based, apply the formula,
+    and return 1-based indices (caller converts to 0-based for NumPy).
     """
-    # Convert 0-based vertex IDs (from np.where) to 1-based
-    vertx_1b = vertex_indices_0based.astype(np.int64) + 1  # (m,)
-
-    offsets = np.arange(-20, 1, dtype=np.int64)  # -20 .. 0 inclusive (21 values)
+    vertx_1b = vertex_indices_0based.astype(np.int64) + 1
+    offsets = np.arange(-20, 1, dtype=np.int64)  # -20..0 (21 samples)
 
     indices = []
     for v in vertx_1b:
         base = v * depth_samples  # v*21
         indices.extend(base + offsets)
 
-    return np.array(indices, dtype=np.int64)  # 1-based indices, as in MATLAB
+    return np.array(indices, dtype=np.int64)  # 1-based indices
 
 
 def _process_hemi(
@@ -143,32 +138,28 @@ def _process_hemi(
         {hemi}_{region_name}.mat  (variable 'lh_cp_dwi' or 'rh_cp_dwi')
         {hemi}_{region_name}.csv
     """
-    max_index = ori_cp_dwi.shape[1]  # number of columns
+    max_index = ori_cp_dwi.shape[1]
+    n_regions_written = 0
 
     for i in range(2, 37):  # MATLAB 2:36
         if i == 5:
             continue
 
         # MATLAB is 1-based; nibabel arrays are 0-based.
-        # So MATLAB row i corresponds to Python index i-1.
         row_idx = i - 1
 
         if row_idx >= len(struct_names) or row_idx >= ctab.shape[0]:
-            # If the color table has fewer entries than expected, skip extras.
             continue
 
         region_name = struct_names[row_idx]
-        # nibabel ctab: RGBA + ID in column 4
-        region_num = int(ctab[row_idx, 4])
+        region_num = int(ctab[row_idx, 4])  # label ID
 
-        vertex_indices = np.where(labels == region_num)[0]  # 0-based
+        vertex_indices = np.where(labels == region_num)[0]
         if vertex_indices.size == 0:
-            # No vertices in this region for this subject/hemisphere
             continue
 
         index_1b = _region_indices_for_vertices(vertex_indices, depth_samples=21)
 
-        # Filter out-of-range indices (MATLAB: index(:, any(index > max_index, 1)) = [])
         valid_mask = index_1b <= max_index
         index_1b = index_1b[valid_mask]
         if index_1b.size == 0:
@@ -177,17 +168,17 @@ def _process_hemi(
         idx_0b = index_1b - 1
         cp_dwi = ori_cp_dwi[:, idx_0b]
 
-        # File naming: 'lh_{region_name}' or 'rh_{region_name}'
         output_name = f"{hemi}_{region_name}"
         mat_path = out_dir / f"{output_name}.mat"
         csv_path = out_dir / f"{output_name}.csv"
 
-        # Variable name in MAT must match MATLAB expectations
         var_name = f"{hemi}_cp_dwi"
         savemat(mat_path, {var_name: cp_dwi})
-
-        # Save CSV (mirrors MATLAB writematrix)
         np.savetxt(csv_path, cp_dwi, delimiter=",")
+
+        n_regions_written += 1
+
+    print(f"{hemi}: wrote {n_regions_written} region files to {out_dir}")
 
 
 def coordinates_in_regions_oneMM_DD(ID: str, input_dir, output_dir):
@@ -204,15 +195,13 @@ def coordinates_in_regions_oneMM_DD(ID: str, input_dir, output_dir):
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
 
-    data_root = input_dir
-    write_root = output_dir
+    # Where to read from
+    qsm_dir = input_dir / ID / "QSM"
+    subject_dir = input_dir / ID / ID  # .../ID/ID/label
 
-    # Where to write per-region label coordinate outputs
-    label_coord_dir = write_root / ID / "QSM" / "label_coord_1mm"
+    # Where to write to
+    label_coord_dir = output_dir / ID / "QSM" / "label_coord_1mm"
     label_coord_dir.mkdir(parents=True, exist_ok=True)
-
-    # Where to read QSM columns from
-    qsm_dir = data_root / ID / "QSM"
 
     col_lh_mat = qsm_dir / f"{ID}_column_lh.mat"
     if not col_lh_mat.is_file():
@@ -221,8 +210,6 @@ def coordinates_in_regions_oneMM_DD(ID: str, input_dir, output_dir):
 
     ori_lh_cp_dwi, ori_rh_cp_dwi = _load_cp_dwi_mats(qsm_dir, ID)
 
-    # Where to read annotations from: input_dir / ID / ID / label
-    subject_dir = data_root / ID / ID
     labels_lh, ctab_lh, names_lh = _load_aparc_annot(subject_dir, "lh")
     labels_rh, ctab_rh, names_rh = _load_aparc_annot(subject_dir, "rh")
 
@@ -246,15 +233,6 @@ def coordinates_in_regions_oneMM_DD(ID: str, input_dir, output_dir):
 
 
 def _cli():
-    """
-    Command-line interface wrapper.
-
-    Example:
-        python coordinates_in_regions_oneMM_DD.py \\
-            --ID S00775 \\
-            --input-dir  /mnt/newStor/paros/paros_WORK/hanwen/ad_decode_test/output/ \\
-            --output-dir /mnt/newStor/paros/paros_WORK/column_code_tester/
-    """
     parser = argparse.ArgumentParser(
         description="Generate cortical column coordinates in different regions (1mm, DWI)."
     )
