@@ -211,7 +211,7 @@ def coordinates_in_regions_oneMM_DD(ID: str, input_dir, output_dir):
     label_coord_dir = output_dir / ID / "QSM" / "label_coord_1mm"
     label_coord_dir.mkdir(parents=True, exist_ok=True)
 
-    qsm_dir = output_dir / ID / "QSM"
+    qsm_dir = input_dir / ID / "QSM"
 
     # Check required .mat file (_column_lh.mat) exists, as in MATLAB
     col_lh_mat = qsm_dir / f"{ID}_column_lh.mat"
