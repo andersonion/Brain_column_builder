@@ -4,7 +4,7 @@
 get_thickness.py
 
 Python translation of MATLAB get_thickness.m, with an added
-region-averaged thickness CSV.
+region-averaged thickness CSV and checksum-based skipping.
 
 Original MATLAB behavior:
 
@@ -14,33 +14,36 @@ Original MATLAB behavior:
     - For i = 2:36 (skip i == 5), extract vertices per region
       and write region-wise thickness files.
 
-This Python version:
+This script does the same, plus:
 
-Inputs (expected layout):
+Per-vertex thickness:
+    <output_dir>/<ID>/thickness/
+        <ID>_lh_<region>_thickness.mat  (var: thickness_lh_region)
+        <ID>_lh_<region>_thickness.csv  (#verts_in_region x 1)
 
-    Pair files:
-        <output_dir>/<ID>/columns_1mm/<ID>_pair_lh.mat   (var: lh_pair)
-        <output_dir>/<ID>/columns_1mm/<ID>_pair_rh.mat   (var: rh_pair)
+        <ID>_rh_<region>_thickness.mat  (var: thickness_rh_region)
+        <ID>_rh_<region>_thickness.csv
 
-    FreeSurfer annotation files:
-        <output_dir>/<ID>/<ID>/label/lh.aparc.annot
-        <output_dir>/<ID>/<ID>/label/rh.aparc.annot
+Region-averaged thickness summary CSV (NEW):
+    <output_dir>/<ID>/thickness/<ID>_thickness_region_means.csv
 
-Outputs:
+    Columns:
+        hemi, region, n_vertices, mean_thickness, std_thickness
 
-    Per-region per-vertex thickness:
-        <output_dir>/<ID>/thickness/
-            <ID>_lh_<region>_thickness.mat  (var: thickness_lh_region)
-            <ID>_lh_<region>_thickness.csv  (#verts_in_region x 1)
+Checksum-based skipping (NEW):
 
-            <ID>_rh_<region>_thickness.mat  (var: thickness_rh_region)
-            <ID>_rh_<region>_thickness.csv
+    For each region name, we also write:
 
-    Region-averaged thickness summary CSV (NEW):
-        <output_dir>/<ID>/thickness/<ID>_thickness_region_means.csv
+        <output_dir>/<ID>/thickness/<ID>_<region>_thickness.sha256
 
-        Columns:
-            hemi, region, n_vertices, mean_thickness, std_thickness
+    On rerun:
+
+      - If LH/RH MAT + CSV exist AND checksum matches AND --force is NOT set:
+          → skip recompute for that region
+          → read the existing CSVs to populate the summary
+
+      - Otherwise:
+          → recompute thickness for that region and update outputs + checksum
 
 Thickness definition:
 
@@ -53,11 +56,37 @@ get_distance_from_pair().
 
 import argparse
 from pathlib import Path
+import hashlib
+import csv
 
 import numpy as np
 from scipy.io import loadmat, savemat
 import nibabel as nib
-import csv
+
+
+PIPELINE_VERSION = "get_thickness_v1.0_20251125"
+
+
+# ------------------ checksum helper ------------------ #
+
+def _region_checksum(ID: str, region_name: str) -> str:
+    """
+    Region-level checksum.
+
+    Currently based only on:
+        - PIPELINE_VERSION
+        - subject ID
+        - region name
+
+    If you change the logic of this script in a way that invalidates
+    old outputs, bump PIPELINE_VERSION to force recompute without
+    needing --force.
+    """
+    h = hashlib.sha256()
+    h.update(PIPELINE_VERSION.encode("utf-8"))
+    h.update(ID.encode("utf-8"))
+    h.update(region_name.encode("utf-8"))
+    return h.hexdigest()
 
 
 # ------------------ distance helper ------------------ #
@@ -118,14 +147,23 @@ def load_aparc_annotation(annot_path: Path):
     names = [n.decode("utf-8") if isinstance(n, bytes) else n for n in names]
 
     print(f"[ANNOT] Loaded {annot_path.name}: "
-          f"{len(labels)} vertices, {len(names)} regions (including 'unknown')")
+          f"{len(labels)} vertices, {len(names)} regions (including 'unknown')}")
 
     return labels, ctab, names
 
 
+def _load_thickness_csv(csv_path: Path) -> np.ndarray:
+    """
+    Load a per-region thickness CSV as a column vector (N, 1).
+    """
+    arr = np.loadtxt(csv_path, delimiter=",")
+    arr = np.atleast_1d(arr)
+    return arr.reshape(-1, 1)
+
+
 # ------------------ main logic ------------------ #
 
-def get_thickness(ID: str, output_dir):
+def get_thickness(ID: str, output_dir, force: bool = False):
     """
     Compute per-vertex and per-region thickness for a subject.
 
@@ -142,6 +180,11 @@ def get_thickness(ID: str, output_dir):
     """
     output_dir = Path(output_dir)
 
+    print(f"\n[INFO] Subject:       {ID}")
+    print(f"[INFO] Output root:   {output_dir}")
+    print(f"[INFO] Pipeline ver:  {PIPELINE_VERSION}")
+    print(f"[INFO] FORCE mode:    {force}")
+
     # ---------------- check / load pair files ---------------- #
 
     pair_dir = output_dir / ID / "columns_1mm"
@@ -149,7 +192,7 @@ def get_thickness(ID: str, output_dir):
     rh_pair_mat = pair_dir / f"{ID}_pair_rh.mat"
 
     if not lh_pair_mat.is_file() or not rh_pair_mat.is_file():
-        print(f"Subject {ID} doesnt have pair files in {pair_dir}")
+        print(f"[WARN] Subject {ID} doesn't have both pair files in {pair_dir}")
         return
 
     print(f"[PAIR] Loading LH pair from: {lh_pair_mat}")
@@ -206,8 +249,10 @@ def get_thickness(ID: str, output_dir):
     #
     # Here:
     #   - names_lh / names_rh = struct_names
-    #   - ctab_lh[i, 4] = struct_id (region_num)
-    #   - labels_lh / labels_rh contain struct_id per vertex
+    #   - labels_lh / labels_rh contain struct index per vertex
+    #
+    # Because nibabel's read_annot returns label indices that correspond to
+    # the row index (0-based) of names/ctab, we can use region_idx directly.
 
     # Index bounds: MATLAB i=2:36 → Python i in [2..36], use region_idx = i-1
     max_i = min(36, len(names_lh))  # safety in case fewer regions exist
@@ -222,70 +267,141 @@ def get_thickness(ID: str, output_dir):
         if region_idx >= len(names_lh) or region_idx >= len(ctab_lh):
             continue
 
+        # Use LH names for region naming (LH/RH matched by index)
+        region_name = names_lh[region_idx]
+
+        # Expected outputs and checksum path
+        lh_out_name = f"{ID}_lh_{region_name}_thickness"
+        rh_out_name = f"{ID}_rh_{region_name}_thickness"
+
+        lh_mat_path = thickness_dir / f"{lh_out_name}.mat"
+        lh_csv_path = thickness_dir / f"{lh_out_name}.csv"
+        rh_mat_path = thickness_dir / f"{rh_out_name}.mat"
+        rh_csv_path = thickness_dir / f"{rh_out_name}.csv"
+
+        checksum_path = thickness_dir / f"{ID}_{region_name}_thickness.sha256"
+
+        outputs_exist = (
+            lh_mat_path.is_file()
+            and lh_csv_path.is_file()
+            and rh_mat_path.is_file()
+            and rh_csv_path.is_file()
+        )
+
+        checksum_ok = False
+        if checksum_path.is_file():
+            try:
+                stored = checksum_path.read_text().strip()
+                expected = _region_checksum(ID, region_name)
+                if stored == expected:
+                    checksum_ok = True
+            except Exception as e:
+                print(f"[WARN] Could not read checksum for region {region_name}: {e}")
+
+        # Try to re-use existing outputs if allowed
+        if (not force) and outputs_exist and checksum_ok:
+            print(f"\n[REGION] {region_name} → outputs + checksum OK; skipping recompute.")
+            reuse_failed = False
+            # LH summary from existing CSV
+            try:
+                lh_vals = _load_thickness_csv(lh_csv_path)
+                if lh_vals.size > 0:
+                    mean_lh = float(lh_vals.mean())
+                    std_lh = float(lh_vals.std(ddof=1)) if lh_vals.size > 1 else 0.0
+                    n_lh = int(lh_vals.shape[0])
+                    region_summary.append(["lh", region_name, n_lh, mean_lh, std_lh])
+            except Exception as e:
+                print(f"  [WARN] Failed to read LH CSV for {region_name}: {e}")
+                reuse_failed = True
+
+            # RH summary from existing CSV
+            try:
+                rh_vals = _load_thickness_csv(rh_csv_path)
+                if rh_vals.size > 0:
+                    mean_rh = float(rh_vals.mean())
+                    std_rh = float(rh_vals.std(ddof=1)) if rh_vals.size > 1 else 0.0
+                    n_rh = int(rh_vals.shape[0])
+                    region_summary.append(["rh", region_name, n_rh, mean_rh, std_rh])
+            except Exception as e:
+                print(f"  [WARN] Failed to read RH CSV for {region_name}: {e}")
+                reuse_failed = True
+
+            if not reuse_failed:
+                # We successfully used existing outputs; move to next region
+                continue
+            else:
+                print(f"  [INFO] Existing outputs unusable for {region_name}; recomputing.")
+
+        elif force:
+            print(f"\n[REGION] {region_name} → FORCE recompute.")
+        else:
+            if outputs_exist and not checksum_ok:
+                print(f"\n[REGION] {region_name} → outputs exist but checksum mismatch/missing; recomputing.")
+            else:
+                print(f"\n[REGION] {region_name} → outputs missing; computing region.")
+
         # ---- LH hemisphere ---- #
-        region_name_lh = names_lh[region_idx]
+        # labels_lh stores index == region_idx for this region
         vert_idx_lh = np.where(labels_lh == region_idx)[0]
 
         if vert_idx_lh.size == 0:
-            print(f"[LH] Region '{region_name_lh}' has 0 vertices, skipping.")
+            print(f"  [LH] Region '{region_name}' has 0 vertices, skipping LH.")
         else:
             max_index_lh = lh_thickness.shape[0]
             vert_idx_lh = vert_idx_lh[vert_idx_lh < max_index_lh]
 
             thickness_lh_region = lh_thickness[vert_idx_lh, :]  # (#verts, 1)
-            out_name_lh = f"{ID}_lh_{region_name_lh}_thickness"
-            mat_path_lh = thickness_dir / f"{out_name_lh}.mat"
-            csv_path_lh = thickness_dir / f"{out_name_lh}.csv"
 
-            savemat(str(mat_path_lh), {"thickness_lh_region": thickness_lh_region})
-            np.savetxt(csv_path_lh, thickness_lh_region, delimiter=",")
+            savemat(str(lh_mat_path), {"thickness_lh_region": thickness_lh_region})
+            np.savetxt(lh_csv_path, thickness_lh_region, delimiter=",")
 
             # region mean / std
             mean_lh = float(thickness_lh_region.mean())
             std_lh = float(thickness_lh_region.std(ddof=1)) if thickness_lh_region.size > 1 else 0.0
             n_lh = int(thickness_lh_region.shape[0])
 
-            region_summary.append(
-                ["lh", region_name_lh, n_lh, mean_lh, std_lh]
-            )
+            region_summary.append(["lh", region_name, n_lh, mean_lh, std_lh])
 
             print(
-                f"[LH] {region_name_lh}: {n_lh} verts → "
-                f"{mat_path_lh.name}, {csv_path_lh.name}, mean={mean_lh:.4f}"
+                f"  [LH] {region_name}: {n_lh} verts → "
+                f"{lh_mat_path.name}, {lh_csv_path.name}, mean={mean_lh:.4f}"
             )
 
         # ---- RH hemisphere ---- #
         if region_idx >= len(names_rh) or region_idx >= len(ctab_rh):
             continue
 
-        region_name_rh = names_rh[region_idx]
+        region_name_rh = names_rh[region_idx]  # should match region_name
+
         vert_idx_rh = np.where(labels_rh == region_idx)[0]
         if vert_idx_rh.size == 0:
-            print(f"[RH] Region '{region_name_rh}' has 0 vertices, skipping.")
+            print(f"  [RH] Region '{region_name_rh}' has 0 vertices, skipping RH.")
         else:
             max_index_rh = rh_thickness.shape[0]
             vert_idx_rh = vert_idx_rh[vert_idx_rh < max_index_rh]
 
             thickness_rh_region = rh_thickness[vert_idx_rh, :]  # (#verts, 1)
-            out_name_rh = f"{ID}_rh_{region_name_rh}_thickness"
-            mat_path_rh = thickness_dir / f"{out_name_rh}.mat"
-            csv_path_rh = thickness_dir / f"{out_name_rh}.csv"
 
-            savemat(str(mat_path_rh), {"thickness_rh_region": thickness_rh_region})
-            np.savetxt(csv_path_rh, thickness_rh_region, delimiter=",")
+            savemat(str(rh_mat_path), {"thickness_rh_region": thickness_rh_region})
+            np.savetxt(rh_csv_path, thickness_rh_region, delimiter=",")
 
             mean_rh = float(thickness_rh_region.mean())
             std_rh = float(thickness_rh_region.std(ddof=1)) if thickness_rh_region.size > 1 else 0.0
             n_rh = int(thickness_rh_region.shape[0])
 
-            region_summary.append(
-                ["rh", region_name_rh, n_rh, mean_rh, std_rh]
-            )
+            region_summary.append(["rh", region_name_rh, n_rh, mean_rh, std_rh])
 
             print(
-                f"[RH] {region_name_rh}: {n_rh} verts → "
-                f"{mat_path_rh.name}, {csv_path_rh.name}, mean={mean_rh:.4f}"
+                f"  [RH] {region_name_rh}: {n_rh} verts → "
+                f"{rh_mat_path.name}, {rh_csv_path.name}, mean={mean_rh:.4f}"
             )
+
+        # --------- write region checksum marker ---------
+        try:
+            checksum = _region_checksum(ID, region_name)
+            checksum_path.write_text(checksum + "\n")
+        except Exception as e:
+            print(f"  [WARN] could not write checksum for region {region_name}: {e}")
 
     # ---------------- write region-mean summary CSV ---------------- #
 
@@ -316,9 +432,14 @@ def _cli():
         required=True,
         help="Root output dir containing <ID>/columns_1mm and <ID>/<ID>/label",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompute region thickness even if outputs + checksum exist.",
+    )
     args = parser.parse_args()
 
-    get_thickness(args.ID, args.output_dir)
+    get_thickness(args.ID, args.output_dir, force=args.force)
 
 
 if __name__ == "__main__":
