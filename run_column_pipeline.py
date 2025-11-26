@@ -5,20 +5,24 @@ run_column_pipeline.py
 
 Wrapper to process ONE subject/ID through the full column/thickness pipeline:
 
-    1) coordinates_in_regions_oneMM_DD.py
-    2) get_columns_in_regions_oneMM_DD.py   (looped over contrasts)
+    0) vertices_connect.py                    (build columns + *_column_*_dwi.mat)
+    1) coordinates_in_regions_oneMM_DD.py     (run ONCE; contrast-agnostic)
+    2) get_columns_in_regions_oneMM_DD.py     (looped over real contrasts)
     3) build_pairs_from_freesurfer.py
     4) get_thickness.py
 
-Assumed function signatures (from your updated scripts):
+Assumed function signatures:
+
+    vertices_connect.vertices_connect(
+        ID: str,
+        root_dir,
+        voldim=(512, 512, 272),
+        voxres=(0.5, 0.5, 0.5),
+    )
 
     coordinates_in_regions_oneMM_DD.coordinates_in_regions_oneMM_DD(
         ID: str,
-        input_dir,
         output_dir,
-        contrast: str = "QSM",
-        force: bool = False,
-        nproc: int = 1,
     )
 
     get_columns_in_regions_oneMM_DD.get_columns_in_regions_oneMM_DD(
@@ -41,43 +45,37 @@ Assumed function signatures (from your updated scripts):
         force: bool = False,
     )
 
-Usage examples
---------------
+Conventions
+-----------
 
-# Single contrast (QSM), default behavior (will use checksum/skip logic inside scripts)
-python run_column_pipeline.py \
-    --ID S00775 \
-    --input-dir /path/to/input_root \
-    --output-dir /path/to/output_root \
-    --contrasts QSM
+- `output_dir` is the root that contains FreeSurfer + columns + all
+  geometry-based outputs:
 
-# Multiple contrasts
-python run_column_pipeline.py \
-    --ID S00775 \
-    --input-dir /path/to/input_root \
-    --output-dir /path/to/output_root \
-    --contrasts QSM MD FA
+      <output_dir>/<ID>/surf/...
+      <output_dir>/<ID>/DWI2T1_dti_upsampled.dat
+      <output_dir>/<ID>/columns/...
+      <output_dir>/<ID>/<ID>/label/...
 
-# Force all steps to recompute (ignoring prior outputs)
-python run_column_pipeline.py \
-    --ID S00775 \
-    --input-dir /path/to/input_root \
-    --output-dir /path/to/output_root \
-    --contrasts QSM MD \
-    --force-all
+- `input_dir` is where the MRI contrast images live, e.g.:
 
-# Use some parallelism in coordinates step
-python run_column_pipeline.py \
-    --ID S00775 \
-    --input-dir /path/to/input_root \
-    --output-dir /path/to/output_root \
-    --contrasts QSM \
-    --nproc-coords 8
+      <input_dir>/<ID>/<ID>_<contrast>_masked.nii.gz
+      <input_dir>/<ID>_<contrast>_masked.nii.gz
+      (plus unmasked)
+
+- Column cp_dwi & region coords are contrast-independent and live under:
+
+      <output_dir>/<ID>/columns/
+      <output_dir>/<ID>/columns/label_coord_1mm/
+
+- Per-contrast intensity samples & QA live under:
+
+      <output_dir>/<ID>/<contrast>/...
 """
 
 import argparse
 from pathlib import Path
 
+from vertices_connect import vertices_connect
 from coordinates_in_regions_oneMM_DD import coordinates_in_regions_oneMM_DD
 from get_columns_in_regions_oneMM_DD import get_columns_in_regions_oneMM_DD
 from build_pairs_from_freesurfer import build_pairs_from_freesurfer
@@ -90,37 +88,64 @@ def run_subject_pipeline(
     output_dir,
     contrasts,
     force_all: bool = False,
-    nproc_coords: int = 1,
+    nproc_coords: int = 1,  # reserved; currently unused
 ):
+    """
+    Run the full pipeline for one subject.
+
+    Parameters
+    ----------
+    ID : str
+        Subject ID (e.g., S00775).
+    input_dir : str or Path
+        Root for contrast images (QSM, MD, FA, etc.).
+    output_dir : str or Path
+        Root for FreeSurfer subjects, columns, and all downstream outputs.
+    contrasts : list of str
+        List of contrast names to sample (e.g., ["QSM", "MD", "FA"]).
+    force_all : bool
+        If True, passed through to downstream steps that support --force.
+    nproc_coords : int
+        Reserved; currently unused but kept in signature to avoid breaking
+        existing CLI calls.
+    """
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     contrasts = list(contrasts)
 
     print("\n================ COLUMN / THICKNESS PIPELINE ================")
-    print(f"[SUBJECT]   {ID}")
-    print(f"[INPUT DIR] {input_dir}")
-    print(f"[OUTPUT DIR]{output_dir}")
-    print(f"[CONTRASTS] {', '.join(contrasts)}")
-    print(f"[FORCE ALL] {force_all}")
-    print(f"[NPROC COORDS] {nproc_coords}")
+    print(f"[SUBJECT]        {ID}")
+    print(f"[INPUT DIR]      {input_dir}")
+    print(f"[OUTPUT DIR]     {output_dir}")
+    print(f"[CONTRASTS]      {', '.join(contrasts)}")
+    print(f"[FORCE ALL]      {force_all}")
+    print(f"[NPROC COORDS]   {nproc_coords} (reserved)")
     print("=============================================================\n")
 
     # ------------------------------------------------------------
-    # 1) coordinates_in_regions_oneMM_DD.py  (per contrast)
+    # 0) vertices_connect.py  (once; geometric + DWI transform)
     # ------------------------------------------------------------
-    for contrast in contrasts:
-        print("\n------------------------------------------------------------")
-        print(f"[STEP 1] coordinates_in_regions_oneMM_DD for contrast: {contrast}")
-        print("------------------------------------------------------------")
+    print("\n------------------------------------------------------------")
+    print("[STEP 0] vertices_connect  (build columns + *_column_*_dwi.mat)")
+    print("------------------------------------------------------------")
 
-        coordinates_in_regions_oneMM_DD(
-            ID=ID,
-            input_dir=input_dir,
-            output_dir=output_dir,
-            contrast=contrast,
-            force=force_all,
-            nproc=nproc_coords,
-        )
+    vertices_connect(
+        ID=ID,
+        root_dir=output_dir,
+        # voldim/voxres are defaulted; expose via CLI if needed
+    )
+
+    # ------------------------------------------------------------
+    # 1) coordinates_in_regions_oneMM_DD.py  (once; contrast-agnostic)
+    # ------------------------------------------------------------
+    print("\n------------------------------------------------------------")
+    print("[STEP 1] coordinates_in_regions_oneMM_DD  (contrast-agnostic)")
+    print("------------------------------------------------------------")
+
+    coordinates_in_regions_oneMM_DD(
+        ID=ID,
+        output_dir=output_dir,
+    )
 
     # ------------------------------------------------------------
     # 2) get_columns_in_regions_oneMM_DD.py  (per contrast)
@@ -177,12 +202,12 @@ def _cli():
     parser.add_argument(
         "--input-dir",
         required=True,
-        help="Root input dir (where <ID>/<contrast>/... and <ID>/<ID>/ live).",
+        help="Root for contrast images (where <ID>_<contrast>[_masked].nii.gz live).",
     )
     parser.add_argument(
         "--output-dir",
         required=True,
-        help="Root output dir (same root used by the component scripts).",
+        help="Root for FreeSurfer data, columns, and all pipeline outputs.",
     )
     parser.add_argument(
         "--contrasts",
@@ -193,13 +218,13 @@ def _cli():
     parser.add_argument(
         "--force-all",
         action="store_true",
-        help="Force recompute for ALL steps (overrides checksum/skip behavior).",
+        help="Force recompute for ALL downstream steps that support it.",
     )
     parser.add_argument(
         "--nproc-coords",
         type=int,
         default=1,
-        help="Number of worker threads per hemisphere for coordinates_in_regions_oneMM_DD.",
+        help="Currently unused; reserved for future parallelization in the coords step.",
     )
 
     args = parser.parse_args()

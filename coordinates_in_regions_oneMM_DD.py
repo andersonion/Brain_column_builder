@@ -1,49 +1,61 @@
 #!/usr/bin/env python
 
 """
-Verbose QA version of coordinates_in_regions_oneMM_DD.
+coordinates_in_regions_oneMM_DD.py
 
-Features:
-- Contrast as CLI arg (default: QSM)
-- Skips regions whose outputs already exist (unless --force)
-- Checksum-based skip: if inputs/code change, existing outputs are treated as stale
-- Thread-based parallel execution per hemisphere via --nproc
+Verbose QA version of region-wise column coordinate extraction.
 
-Usage:
-    python coordinates_in_regions_oneMM_DD.py \
-        --ID S00775 \
-        --input-dir  /mnt/newStor/paros/paros_WORK/hanwen/ad_decode_test/output/ \
-        --output-dir /mnt/newStor/paros/paros_WORK/column_code_tester/ \
-        --contrast QSM \
-        --nproc 4
+This script takes whole-hemisphere column coordinate matrices
+(<ID>_column_lh_dwi.mat, <ID>_column_rh_dwi.mat) and parcels them
+into region-wise coordinate files based on aparc annotations.
+
+It is COMPLETELY contrast-agnostic.
+
+Directory layout
+----------------
+
+Expected inputs (per subject):
+
+    <output_dir>/<ID>/columns/
+        <ID>_column_lh_dwi.mat   (var: lh_cp_dwi, shape (4, N_lh))
+        <ID>_column_rh_dwi.mat   (var: rh_cp_dwi, shape (4, N_rh))
+
+    <output_dir>/<ID>/<ID>/label/
+        lh.aparc.annot
+        rh.aparc.annot
+
+Outputs (per subject, shared across all contrasts):
+
+    <output_dir>/<ID>/columns/label_coord_1mm/
+        lh_<region>.mat (var: lh_cp_dwi for that region)
+        lh_<region>.csv
+        rh_<region>.mat (var: rh_cp_dwi for that region)
+        rh_<region>.csv
+
+These region-wise coordinate files are then used by
+get_columns_in_regions_oneMM_DD.py for ANY contrast.
 """
 
 import argparse
-import hashlib
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from scipy.io import loadmat, savemat
 import nibabel.freesurfer as fsio
 
 
-PIPELINE_VERSION = "column_coords_v1.1_20251125"
+DEPTH_SAMPLES = 21
 
 
 # ------------------ LOW-LEVEL LOADERS ------------------ #
 
-def _load_cp_dwi_mats(contrast_dir: Path, ID: str):
-    """Load *_column_* DWI coordinate matrices and print shapes."""
-    lh_mat = contrast_dir / f"{ID}_column_lh.mat"
-    rh_mat = contrast_dir / f"{ID}_column_rh.mat"
-    lh_dwi_mat = contrast_dir / f"{ID}_column_lh_dwi.mat"
-    rh_dwi_mat = contrast_dir / f"{ID}_column_rh_dwi.mat"
+def _load_cp_dwi_mats(columns_dir: Path, ID: str):
+    """Load *_column_*_dwi.mat coordinate matrices and print shapes."""
+    lh_dwi_mat = columns_dir / f"{ID}_column_lh_dwi.mat"
+    rh_dwi_mat = columns_dir / f"{ID}_column_rh_dwi.mat"
 
-    print("\n[LOAD] column dir:", contrast_dir)
+    print("\n[LOAD] Columns dir:", columns_dir)
     print("[LOAD] Expecting:")
-    print(f"  {lh_mat}")
-    print(f"  {rh_mat}")
     print(f"  {lh_dwi_mat}")
     print(f"  {rh_dwi_mat}")
 
@@ -51,11 +63,6 @@ def _load_cp_dwi_mats(contrast_dir: Path, ID: str):
         raise FileNotFoundError(f"Missing required: {lh_dwi_mat}")
     if not rh_dwi_mat.is_file():
         raise FileNotFoundError(f"Missing required: {rh_dwi_mat}")
-
-    if lh_mat.is_file():
-        _ = loadmat(lh_mat)
-    if rh_mat.is_file():
-        _ = loadmat(rh_mat)
 
     lh_dwi = loadmat(lh_dwi_mat)
     rh_dwi = loadmat(rh_dwi_mat)
@@ -75,9 +82,15 @@ def _load_cp_dwi_mats(contrast_dir: Path, ID: str):
 
 
 def _load_aparc_annot(subject_dir: Path, hemi: str):
-    """Load FreeSurfer aparc annotation and print stats."""
+    """
+    Load FreeSurfer aparc annotation for one hemisphere and print basic stats.
+
+    IMPORTANT: In nibabel, 'labels' are *indices* into ctab/names,
+    not the original RGB-coded IDs (ctab[:,4]).
+    """
     annot_fname = subject_dir / "label" / f"{hemi}.aparc.annot"
-    print(f"\n[ANNOT] Loading {hemi}.aparc.annot from:\n        {annot_fname}")
+    print(f"\n[ANNOT] Loading {hemi}.aparc.annot from:")
+    print("        ", annot_fname)
 
     if not annot_fname.is_file():
         raise FileNotFoundError(f"Missing annotation: {annot_fname}")
@@ -89,324 +102,182 @@ def _load_aparc_annot(subject_dir: Path, hemi: str):
         for n in names
     ]
 
-    print(f"[ANNOT] {hemi}: labels={labels.shape}, unique={len(np.unique(labels))}")
-    print(f"[ANNOT] {hemi}: struct_names={len(struct_names)}, ctab rows={ctab.shape[0]}")
-    print(f"[ANNOT] {hemi}: first names: {struct_names[:5]}")
+    unique_labels = np.unique(labels)
+    print(f"[ANNOT] {hemi}: labels shape = {labels.shape}, unique labels = {len(unique_labels)}")
+    print(f"[ANNOT] {hemi}: struct_names = {len(struct_names)}, ctab rows = {ctab.shape[0]}")
+    print(f"[ANNOT] {hemi}: first 10 unique label indices: {unique_labels[:10]}")
 
     return labels, ctab, struct_names
 
 
-def _region_indices_for_vertices(vertex_indices: np.ndarray) -> np.ndarray:
+# ------------------ INDEXING UTIL ------------------ #
+
+def _region_indices_for_vertices(vertex_indices_0b: np.ndarray, depth_samples: int = DEPTH_SAMPLES):
     """
-    Given vertex indices (0-based), produce 1-based "depth indices" into cp_dwi columns.
+    From 0-based vertex indices, compute 0-based depth-sample indices into
+    the cp_dwi array.
+
+    Each vertex has 'depth_samples' points; we assume the cp_dwi columns are
+    laid out as:
+
+        [v0_d0, v0_d1, ..., v0_d20,
+         v1_d0, v1_d1, ..., v1_d20,
+         v2_d0, ... ]
+
+    For a vertex index v, its depth columns are:
+
+        v * depth_samples + [0, 1, ..., depth_samples-1]
     """
-    if vertex_indices.size == 0:
-        return np.array([], dtype=int)
+    vertex_indices_0b = np.asarray(vertex_indices_0b, dtype=int)
 
-    depths = np.arange(48, dtype=int)   # 0..47
-    depth_indices = depths + 48         # 48..95
+    if vertex_indices_0b.size == 0:
+        return np.zeros((0,), dtype=int)
 
-    repeated = np.tile(depth_indices[:, None], (1, vertex_indices.size))
-    index_1b = repeated.flatten(order="F")
+    depth_idx = np.arange(depth_samples, dtype=int)  # [0..20]
+    region_cols = vertex_indices_0b[:, None] * depth_samples + depth_idx[None, :]
+    region_cols_flat = region_cols.ravel(order="C")
 
-    return index_1b
-
-
-# ------------------ CHECKSUM UTILITIES ------------------ #
-
-def _compute_hemi_checksum(
-    hemi: str,
-    labels: np.ndarray,
-    ctab: np.ndarray,
-    struct_names: list[str],
-    ori_cp_dwi: np.ndarray,
-) -> str:
-    """Compute a SHA256 checksum for all inputs relevant to one hemisphere."""
-    h = hashlib.sha256()
-    h.update(PIPELINE_VERSION.encode("utf-8"))
-    h.update(hemi.encode("utf-8"))
-    h.update(labels.tobytes())
-    h.update(ctab.tobytes())
-    joined_names = "\n".join(struct_names).encode("utf-8")
-    h.update(joined_names)
-    h.update(ori_cp_dwi.tobytes())
-    return h.hexdigest()
+    return region_cols_flat
 
 
-# ------------------ PER-REGION PROCESSING (POSSIBLY PARALLEL) ------------------ #
-
-def _process_single_region(
-    i: int,
-    hemi: str,
-    labels: np.ndarray,
-    ctab: np.ndarray,
-    struct_names: list[str],
-    ori_cp_dwi: np.ndarray,
-    out_dir: Path,
-    max_index: int,
-    skip_existing_ok: bool,
-    force: bool,
-):
-    """
-    Process a single region index i.
-    Returns:
-        (files_written, regions_with_vertices, skipped_messages_list)
-    """
-    skipped_msgs = []
-    files_written = 0
-    regions_with_vertices = 0
-
-    row_idx = i - 1
-    region_name = struct_names[row_idx] if 0 <= row_idx < len(struct_names) else None
-
-    # MATLAB hard-coded skip
-    if i == 5:
-        msg = f"{hemi} i={i}, row_idx={row_idx}, region={region_name or '<unknown>'}: MATLAB skip (i=5)"
-        print(f"[{hemi}] {msg}")
-        skipped_msgs.append(msg)
-        return files_written, regions_with_vertices, skipped_msgs
-
-    if row_idx >= len(struct_names) or row_idx >= ctab.shape[0]:
-        msg = f"{hemi} i={i}, row_idx={row_idx}: out of bounds for struct_names/ctab → skip"
-        print(f"[{hemi}] {msg}")
-        skipped_msgs.append(msg)
-        return files_written, regions_with_vertices, skipped_msgs
-
-    region_index = row_idx
-    region_id_orig = int(ctab[row_idx, 4])
-
-    vertex_indices = np.where(labels == region_index)[0]
-    n_vertices = vertex_indices.size
-
-    print(f"\n[{hemi}] REGION i={i}, row_idx={row_idx}")
-    print(f"    name          = '{region_name}'")
-    print(f"    region_index  = {region_index} (labels index)")
-    print(f"    region_id_orig= {region_id_orig} (ctab[:,4])")
-    print(f"    n_vertices    = {n_vertices}")
-
-    if n_vertices == 0:
-        msg = (
-            f"{hemi} region '{region_name}' (i={i}, index={region_index}): "
-            "no vertices with this label index → skip"
-        )
-        print(f"    -> {msg}")
-        skipped_msgs.append(msg)
-        return files_written, regions_with_vertices, skipped_msgs
-
-    regions_with_vertices = 1
-
-    output_name = f"{hemi}_{region_name}"
-    mat_path = out_dir / f"{output_name}.mat"
-    csv_path = out_dir / f"{output_name}.csv"
-
-    # Skip if outputs exist and we trust them (skip_existing_ok == True)
-    if skip_existing_ok and mat_path.is_file() and csv_path.is_file():
-        msg = f"{hemi} region '{region_name}' (i={i}): output exists and checksum OK → skipping"
-        print(f"    -> {msg}")
-        skipped_msgs.append(msg)
-        return files_written, regions_with_vertices, skipped_msgs
-
-    if force:
-        print("    -> FORCE recompute")
-
-    # Compute depth indices
-    index_1b = _region_indices_for_vertices(vertex_indices)
-    valid_mask = index_1b <= max_index
-    index_1b = index_1b[valid_mask]
-
-    print(f"    depth indices kept = {index_1b.size} (after clipping > max_index)")
-
-    if index_1b.size == 0:
-        msg = (
-            f"{hemi} region '{region_name}' (i={i}, index={region_index}): "
-            "no valid depth indices after clipping → skip"
-        )
-        print(f"    -> {msg}")
-        skipped_msgs.append(msg)
-        return files_written, regions_with_vertices, skipped_msgs
-
-    idx_0b = index_1b - 1
-    cp_dwi = ori_cp_dwi[:, idx_0b]
-
-    savemat(mat_path, {f"{hemi}_cp_dwi": cp_dwi})
-    np.savetxt(csv_path, cp_dwi, delimiter=",")
-
-    print(f"    -> WROTE {mat_path.name}, {csv_path.name}")
-    files_written = 1
-
-    return files_written, regions_with_vertices, skipped_msgs
-
-
-# ------------------ CORE PER-HEMI PROCESSING ------------------ #
+# ------------------ PER-REGION PROCESSING ------------------ #
 
 def _process_hemi(
     hemi: str,
     labels: np.ndarray,
     ctab: np.ndarray,
-    struct_names: list[str],
+    struct_names,
     ori_cp_dwi: np.ndarray,
     out_dir: Path,
-    force: bool = False,
-    nproc: int = 1,
 ):
     print(f"\n===== PROCESSING {hemi.upper()} HEMISPHERE =====")
     max_index = ori_cp_dwi.shape[1]
 
-    # ---- Checksum logic ----
-    checksum_path = out_dir / f"{hemi}_inputs.sha256"
-    current_checksum = _compute_hemi_checksum(hemi, labels, ctab, struct_names, ori_cp_dwi)
-    previous_checksum = None
-    inputs_changed = False
+    n_regions_with_vertices = 0
+    n_written = 0
 
-    if checksum_path.is_file():
-        try:
-            previous_checksum = checksum_path.read_text().strip()
-            if previous_checksum != current_checksum:
-                inputs_changed = True
-        except Exception as e:
-            print(f"[{hemi}] WARNING: Failed to read previous checksum: {e}")
-            inputs_changed = True
-    else:
-        inputs_changed = True  # no checksum yet → treat as "new"
+    # MATLAB loop: for i = 2:36, skip i == 5
+    max_i = min(36, len(struct_names), ctab.shape[0])
 
-    if inputs_changed:
-        print(f"[{hemi}] INPUTS OR CODE CHANGED (checksum mismatch or missing).")
-        print(f"[{hemi}] Existing outputs will NOT be trusted; recomputing regions as needed.")
-    else:
-        print(f"[{hemi}] Checksum matches. Existing outputs considered up-to-date.")
+    for i in range(2, max_i + 1):  # inclusive
+        if i == 5:
+            print(f"[{hemi}] SKIP MATLAB i=5")
+            continue
 
-    # Write (or overwrite) checksum file with current value
-    try:
-        checksum_path.write_text(current_checksum + "\n")
-    except Exception as e:
-        print(f"[{hemi}] WARNING: could not write checksum file: {e}")
+        row_idx = i - 1  # 0-based row in struct_names/ctab
 
-    # skip_existing_ok means we are allowed to skip based on existing files.
-    skip_existing_ok = (not force) and (not inputs_changed)
+        if row_idx >= len(struct_names) or row_idx >= ctab.shape[0]:
+            print(f"[{hemi}] i={i}: row_idx={row_idx} out of bounds for struct_names/ctab, skipping.")
+            continue
 
-    # ---- Parallel region processing ----
-    region_indices = [i for i in range(2, 37)]  # MATLAB: 2..36
-    total_files_written = 0
-    total_regions_with_vertices = 0
-    all_skipped_msgs = []
+        region_name = struct_names[row_idx]
+        region_id_orig = int(ctab[row_idx, 4])   # original FS ID (informational)
+        region_index = row_idx                   # nibabel labels store this index
 
-    def _task(i):
-        return _process_single_region(
-            i=i,
-            hemi=hemi,
-            labels=labels,
-            ctab=ctab,
-            struct_names=struct_names,
-            ori_cp_dwi=ori_cp_dwi,
-            out_dir=out_dir,
-            max_index=max_index,
-            skip_existing_ok=skip_existing_ok,
-            force=force,
-        )
+        # nibabel: labels contain the row index into names/ctab
+        vertex_indices = np.where(labels == region_index)[0]
+        n_vertices = vertex_indices.size
 
-    if nproc is None or nproc < 1:
-        nproc = 1
+        print(f"\n[{hemi}] REGION i={i}, row_idx={row_idx}")
+        print(f"    name          = '{region_name}'")
+        print(f"    region_index  = {region_index} (matches 'labels')")
+        print(f"    region_id_orig= {region_id_orig} (ctab[:,4])")
+        print(f"    n_vertices    = {n_vertices}")
 
-    if nproc == 1:
-        for i in region_indices:
-            files_written, regions_with_vertices, skipped_msgs = _task(i)
-            total_files_written += files_written
-            total_regions_with_vertices += regions_with_vertices
-            all_skipped_msgs.extend(skipped_msgs)
-    else:
-        print(f"[{hemi}] Running with nproc={nproc} (thread-based parallelism)")
-        with ThreadPoolExecutor(max_workers=nproc) as ex:
-            for files_written, regions_with_vertices, skipped_msgs in ex.map(_task, region_indices):
-                total_files_written += files_written
-                total_regions_with_vertices += regions_with_vertices
-                all_skipped_msgs.extend(skipped_msgs)
+        if n_vertices == 0:
+            print(f"    -> No vertices with label index {region_index}, skipping region.")
+            continue
 
-    # ---- Summary ----
+        n_regions_with_vertices += 1
+
+        # Compute cp_dwi column indices for this region
+        region_cols = _region_indices_for_vertices(vertex_indices, depth_samples=DEPTH_SAMPLES)
+        region_cols = region_cols[region_cols < max_index]
+
+        if region_cols.size == 0:
+            print("    -> After bounds check, no columns remain; skipping.")
+            continue
+
+        cp_dwi = ori_cp_dwi[:, region_cols]
+
+        # Save MAT and CSV
+        mat_path = out_dir / f"{hemi}_{region_name}.mat"
+        csv_path = out_dir / f"{hemi}_{region_name}.csv"
+
+        savemat(mat_path, {f"{hemi}_cp_dwi": cp_dwi})
+        np.savetxt(csv_path, cp_dwi, delimiter=",")
+
+        print(f"    -> WROTE {mat_path.name}, {csv_path.name}")
+        n_written += 1
+
     print(f"\n>>> SUMMARY {hemi.upper()} <<<")
-    print(f"    Files written this run:   {total_files_written}")
-    print(f"    Regions with vertices:    {total_regions_with_vertices}")
-    print(f"    Output dir:               {out_dir}")
-
-    print(f"\n>>> {hemi.upper()} REGIONS SKIPPED / NOT WRITTEN <<<")
-    if all_skipped_msgs:
-        for msg in all_skipped_msgs:
-            print("    -", msg)
-    else:
-        print("    None.")
+    print(f"    Regions with vertices: {n_regions_with_vertices}")
+    print(f"    Files written:         {n_written}")
+    print(f"    Output dir:            {out_dir}")
 
 
 # ------------------ TOP-LEVEL FUNCTION ------------------ #
 
-def coordinates_in_regions_oneMM_DD(
-    ID: str,
-    input_dir,
-    output_dir,
-    contrast: str = "QSM",
-    force: bool = False,
-    nproc: int = 1,
-):
-    input_dir = Path(input_dir)
+def coordinates_in_regions_oneMM_DD(ID: str, output_dir):
+    """
+    Main driver for one subject.
+
+    This is contrast-blind. It only:
+
+        - Reads DWI-space column coords from:
+              <output_dir>/<ID>/columns/<ID>_column_lh_dwi.mat
+              <output_dir>/<ID>/columns/<ID>_column_rh_dwi.mat
+
+        - Reads labels from:
+              <output_dir>/<ID>/<ID>/label/lh.aparc.annot
+              <output_dir>/<ID>/<ID>/label/rh.aparc.annot
+
+        - Writes region coords to:
+              <output_dir>/<ID>/columns/label_coord_1mm/
+    """
     output_dir = Path(output_dir)
 
-    contrast_dir = input_dir / ID / contrast
-    subject_dir = input_dir / ID / ID
-    out_dir = output_dir / ID / contrast / "label_coord_1mm"
+    columns_dir = output_dir / ID / "columns"
+    subject_dir = output_dir / ID / ID
+    out_dir = columns_dir / "label_coord_1mm"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n[PATH] -------")
     print("[PATH] Subject ID:         ", ID)
-    print("[PATH] Input dir:          ", input_dir)
-    print("[PATH] Contrast:           ", contrast)
-    print("[PATH] Column dir:         ", contrast_dir)
+    print("[PATH] Output root:        ", output_dir)
+    print("[PATH] Columns dir:        ", columns_dir)
     print("[PATH] Subject dir (labels)", subject_dir)
     print("[PATH] Output dir:         ", out_dir)
-    print("[PATH] FORCE mode:         ", force)
-    print("[PATH] nproc (per hemi):   ", nproc)
-    print("[PATH] Pipeline version:   ", PIPELINE_VERSION)
 
-    ori_lh_cp_dwi, ori_rh_cp_dwi = _load_cp_dwi_mats(contrast_dir, ID)
+    # Column coordinate matrices (DWI space)
+    ori_lh_cp_dwi, ori_rh_cp_dwi = _load_cp_dwi_mats(columns_dir, ID)
 
+    # Annotation files
     labels_lh, ctab_lh, names_lh = _load_aparc_annot(subject_dir, "lh")
     labels_rh, ctab_rh, names_rh = _load_aparc_annot(subject_dir, "rh")
 
-    _process_hemi("lh", labels_lh, ctab_lh, names_lh, ori_lh_cp_dwi, out_dir, force, nproc)
-    _process_hemi("rh", labels_rh, ctab_rh, names_rh, ori_rh_cp_dwi, out_dir, force, nproc)
+    # Process hemispheres
+    _process_hemi("lh", labels_lh, ctab_lh, names_lh, ori_lh_cp_dwi, out_dir)
+    _process_hemi("rh", labels_rh, ctab_rh, names_rh, ori_rh_cp_dwi, out_dir)
 
 
 # ------------------ CLI ENTRY ------------------ #
 
 def _cli():
     parser = argparse.ArgumentParser(
-        description="Verbose QA cortical column region extraction."
+        description="Verbose QA cortical column region extraction (contrast-agnostic)."
     )
     parser.add_argument("--ID", required=True, help="Subject ID (e.g. S00775)")
-    parser.add_argument("--input-dir", required=True, help="Input root dir")
-    parser.add_argument("--output-dir", required=True, help="Output root dir")
     parser.add_argument(
-        "--contrast",
-        default="QSM",
-        help="Contrast subfolder under ID containing *_column_* files (e.g. QSM, MD, FA).",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Recompute all regions even when outputs + checksum exist.",
-    )
-    parser.add_argument(
-        "--nproc",
-        type=int,
-        default=1,
-        help="Number of parallel worker threads per hemisphere.",
+        "--output-dir",
+        required=True,
+        help="Root dir containing <ID>/columns and <ID>/<ID>/label.",
     )
     args = parser.parse_args()
 
     coordinates_in_regions_oneMM_DD(
         ID=args.ID,
-        input_dir=args.input_dir,
         output_dir=args.output_dir,
-        contrast=args.contrast,
-        force=args.force,
-        nproc=args.nproc,
     )
 
 

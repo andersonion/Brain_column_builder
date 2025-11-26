@@ -3,51 +3,32 @@
 """
 get_columns_in_regions_oneMM_DD.py
 
-- No hardcoded 'QSM' anywhere.
-- Supports arbitrary contrasts, via --contrast.
-- Expects a contrast image that may be stored in any of these locations
-  (in priority order):
+Sample MRI contrast along cortical columns and generate QA outputs.
+
+Key behavior
+------------
+
+- Contrast images are contrast-specific and loaded from `input_dir` using
+  flexible patterns:
 
     1) <input_dir>/<ID>/<ID>_<contrast>_masked.nii.gz
     2) <input_dir>/<ID>_<contrast>_masked.nii.gz
     3) <input_dir>/<ID>/<ID>_<contrast>.nii.gz
     4) <input_dir>/<ID>_<contrast>.nii.gz
 
-  The first existing path in that list is used, with masked preferred.
+- Column coordinates are contrast-agnostic and shared across all contrasts:
 
-- Also expects:
-    <output_dir>/<ID>/<contrast>/label_coord_1mm/*.mat
-  produced by coordinates_in_regions_oneMM_DD.py.
+    <output_dir>/<ID>/columns/label_coord_1mm/
+        lh_<region>.mat (var: lh_cp_dwi)
+        rh_<region>.mat (var: rh_cp_dwi)
 
-- Produces:
-    Per-column values:
-        <output_dir>/<ID>/<contrast>/<contrast>_cols_by_column/
-            <ID>_lh_<region>_cols_<contrast>.csv
-            <ID>_rh_<region>_cols_<contrast>.csv
-            <ID>_cols_<contrast>_summary.csv
+- Per-contrast outputs go under:
 
-    Region-mean depth profiles (21×1):
-        <output_dir>/<ID>/<contrast>/<contrast>_cols_region_mean/
-            <ID>_lh_<region>_cols_<contrast}_mean.csv
-            <ID>_rh_<region>_cols_<contrast}_mean.csv
+    <output_dir>/<ID>/<contrast>/...
 
-    QA plots and line-profile CI CSV:
-        <output_dir>/<ID>/<contrast>/plots_QA/
-            <ID>_lh_<region>_profile_<contrast>.png
-            <ID>_rh_<region>_profile_<contrast>.png
-            <ID>_profiles_QA_<contrast>.csv
+Checksum-based skipping is per-region, per-contrast, via:
 
-    Region-level checksum:
-        <output_dir>/<ID>/<contrast>/plots_QA/
-            <ID>_<region>_cols_<contrast>.sha256
-
-Checksum-based skipping:
-
-  For each region, if all expected outputs exist AND the checksum matches
-  AND --force is NOT given, the region is skipped and its QA entries and
-  summary are NOT recomputed.
-
-Use --force to recompute a region even if outputs + checksum exist.
+    <output_dir>/<ID>/<contrast>/plots_QA/<ID>_<region>_cols_<contrast>.sha256
 """
 
 import argparse
@@ -66,12 +47,7 @@ PIPELINE_VERSION = "get_columns_v1.0_20251125"
 
 
 def _region_checksum(ID: str, contrast: str, region: str) -> str:
-    """Return a stable checksum string for one region's config.
-
-    Currently based on pipeline version, subject ID, contrast name, and region name.
-    If you change processing logic in a way that invalidates old outputs,
-    bump PIPELINE_VERSION to force recompute.
-    """
+    """Return a stable checksum string for one region's config."""
     h = hashlib.sha256()
     h.update(PIPELINE_VERSION.encode("utf-8"))
     h.update(ID.encode("utf-8"))
@@ -128,11 +104,8 @@ def _load_contrast_image(input_dir: Path, ID: str, contrast: str) -> np.ndarray:
 
         1) <input_dir>/<ID>/<ID>_<contrast>_masked.nii.gz
         2) <input_dir>/<ID>_<contrast>_masked.nii.gz
-
         3) <input_dir>/<ID>/<ID>_<contrast>.nii.gz
         4) <input_dir>/<ID>_<contrast>.nii.gz
-
-    Any one that exists is accepted, with masked preferentially chosen.
     """
     candidates = [
         input_dir / ID / f"{ID}_{contrast}_masked.nii.gz",
@@ -201,10 +174,17 @@ def _sample_columns(
     """
     Sample volume at coordinates in cp_dwi.
 
-    cp_dwi: shape (4, N_coords), first three rows are x,y,z (1-based).
+    cp_dwi: shape (4, N_coords) or (3, N_coords); first three rows are x,y,z (1-based).
     Returns: values shape (N_columns, points_num).
     """
-    n_coords = cp_dwi.shape[1]
+    if cp_dwi.shape[0] == 4:
+        coords = cp_dwi[0:3, :]  # drop homogeneous row
+    elif cp_dwi.shape[0] == 3:
+        coords = cp_dwi
+    else:
+        raise ValueError(f"cp_dwi must have 3 or 4 rows, got {cp_dwi.shape}")
+
+    n_coords = coords.shape[1]
 
     if n_coords % points_num != 0:
         raise ValueError(f"Invalid cp_dwi size {n_coords} for points_num {points_num}")
@@ -217,11 +197,11 @@ def _sample_columns(
     for d in range(points_num):
         idx = d + np.arange(columns) * points_num
 
-        coords = cp_dwi[0:3, idx].astype(float)
-        coords -= 1.0  # MATLAB → Python indexing
+        c = coords[:, idx].astype(float)
+        c -= 1.0  # MATLAB 1-based → Python 0-based
 
         sampled = map_coordinates(
-            vol, coords, order=1, mode="nearest"
+            vol, c, order=1, mode="nearest"
         )
         vals[:, d] = sampled
 
@@ -248,9 +228,7 @@ def _compute_mean_and_ci(
     n_cols = vals.shape[0]
     mean = vals.mean(axis=0)
 
-    # two-sided normal CI
     from scipy.stats import norm
-
     z = norm.ppf(0.5 + ci_level / 2.0)
     std = vals.std(axis=0, ddof=1)
     sem = std / np.sqrt(n_cols)
@@ -269,9 +247,7 @@ def _plot_profile_with_ci(
     title: str,
     contrast: str,
 ):
-    """
-    Save a PNG of the depth profile with shaded CI.
-    """
+    """Save a PNG of the depth profile with shaded CI."""
     fig, ax = plt.subplots()
     ax.plot(depth_indices, mean)
     ax.fill_between(depth_indices, ci_low, ci_high, alpha=0.3)
@@ -303,8 +279,8 @@ def get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir, contrast, force=F
     # load MRI contrast
     vol = _load_contrast_image(input_dir, ID, contrast)
 
-    # expected label coord folder from script 1
-    label_coord_dir = output_dir / ID / contrast / "label_coord_1mm"
+    # SHARED label coord folder (contrast-agnostic)
+    label_coord_dir = output_dir / ID / "columns" / "label_coord_1mm"
     if not label_coord_dir.is_dir():
         raise FileNotFoundError(f"Missing label_coord_1mm in: {label_coord_dir}")
 
@@ -324,7 +300,6 @@ def get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir, contrast, force=F
     summary = []       # for per-column summary CSV
     qa_rows = []       # for QA profiles CSV (all regions)
 
-    # loop over regions
     for region in REGION_LIST:
         print(f"\n[REGION] {region}")
 
@@ -482,7 +457,7 @@ def _cli():
     p.add_argument(
         "--output-dir",
         required=True,
-        help="Root for <ID>/<contrast>/...",
+        help="Root for <ID>/columns and <ID>/<contrast>/ outputs.",
     )
     p.add_argument(
         "--contrast",
