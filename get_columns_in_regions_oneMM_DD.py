@@ -5,9 +5,19 @@ get_columns_in_regions_oneMM_DD.py
 
 - No hardcoded 'QSM' anywhere.
 - Supports arbitrary contrasts, via --contrast.
-- Expects:
-    <input_dir>/<ID>/<ID>_<contrast>_masked.nii.gz
+- Expects a contrast image that may be stored in any of these locations
+  (in priority order):
+
+    1) <input_dir>/<ID>/<ID>_<contrast>_masked.nii.gz
+    2) <input_dir>/<ID>_<contrast>_masked.nii.gz
+    3) <input_dir>/<ID>/<ID>_<contrast>.nii.gz
+    4) <input_dir>/<ID>_<contrast>.nii.gz
+
+  The first existing path in that list is used, with masked preferred.
+
+- Also expects:
     <output_dir>/<ID>/<contrast>/label_coord_1mm/*.mat
+  produced by coordinates_in_regions_oneMM_DD.py.
 
 - Produces:
     Per-column values:
@@ -26,6 +36,18 @@ get_columns_in_regions_oneMM_DD.py
             <ID>_lh_<region>_profile_<contrast>.png
             <ID>_rh_<region>_profile_<contrast>.png
             <ID>_profiles_QA_<contrast>.csv
+
+    Region-level checksum:
+        <output_dir>/<ID>/<contrast>/plots_QA/
+            <ID>_<region>_cols_<contrast>.sha256
+
+Checksum-based skipping:
+
+  For each region, if all expected outputs exist AND the checksum matches
+  AND --force is NOT given, the region is skipped and its QA entries and
+  summary are NOT recomputed.
+
+Use --force to recompute a region even if outputs + checksum exist.
 """
 
 import argparse
@@ -99,13 +121,41 @@ REGION_LIST = [
 # ---------------- IMAGE LOADING ---------------- #
 
 def _load_contrast_image(input_dir: Path, ID: str, contrast: str) -> np.ndarray:
-    image_path = input_dir / ID / f"{ID}_{contrast}_masked.nii.gz"
-    print(f"[IMG] Looking for <{contrast}> image at: {image_path}")
+    """
+    Load contrast image with flexible path resolution.
 
-    if not image_path.is_file():
-        raise FileNotFoundError(f"Missing masked {contrast} image: {image_path}")
+    Acceptable patterns (in priority order):
 
-    img = nib.load(str(image_path))
+        1) <input_dir>/<ID>/<ID>_<contrast>_masked.nii.gz
+        2) <input_dir>/<ID>_<contrast>_masked.nii.gz
+
+        3) <input_dir>/<ID>/<ID>_<contrast>.nii.gz
+        4) <input_dir>/<ID>_<contrast>.nii.gz
+
+    Any one that exists is accepted, with masked preferentially chosen.
+    """
+    candidates = [
+        input_dir / ID / f"{ID}_{contrast}_masked.nii.gz",
+        input_dir / f"{ID}_{contrast}_masked.nii.gz",
+        input_dir / ID / f"{ID}_{contrast}.nii.gz",
+        input_dir / f"{ID}_{contrast}.nii.gz",
+    ]
+
+    found = None
+    for p in candidates:
+        if p.is_file():
+            found = p
+            break
+
+    if found is None:
+        raise FileNotFoundError(
+            f"Could not locate contrast image for ID={ID}, contrast={contrast}\n"
+            f"Tried:\n" + "\n".join([f"  {str(c)}" for c in candidates])
+        )
+
+    print(f"[IMG] Using contrast image: {found}")
+
+    img = nib.load(str(found))
     vol = img.get_fdata()
 
     if vol.ndim == 4:
@@ -378,7 +428,8 @@ def get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir, contrast, force=F
             rh_ci_high,
             rh_png_path,
             title=f"{ID} rh {region} ({contrast})",
-            contrast=contrast),
+            contrast=contrast,
+        )
         print(f"  -> RH QA plot saved → {rh_png_path}")
 
         for d_idx, m, lo, hi in zip(depth_indices, rh_mean, rh_ci_low, rh_ci_high):
@@ -426,7 +477,7 @@ def _cli():
     p.add_argument(
         "--input-dir",
         required=True,
-        help="Root containing <ID>/<ID>_<contrast>_masked.nii.gz",
+        help="Root containing contrast images in one of the supported layouts.",
     )
     p.add_argument(
         "--output-dir",
