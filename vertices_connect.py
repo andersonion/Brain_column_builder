@@ -130,6 +130,11 @@ def _find_first_4x4_block(dat_path: Path):
     """
     Look for the first 4 consecutive lines in the file that each contain
     at least 4 float-like tokens. Interpret that as a 4×4 matrix.
+
+    We treat the 4×4 as already in standard FreeSurfer-style row-major:
+        [ R | T ]
+        [ 0 | 1 ]
+    i.e., NO transpose is applied when using it.
     """
     lines = dat_path.read_text().splitlines()
     n = len(lines)
@@ -191,14 +196,16 @@ def _fallback_load_matrix(dat_path: Path):
 
 def load_trans_M(dat_path: Path) -> np.ndarray:
     """
-    Load DWI2T1 transform matrix from .dat file.
+    Load DWI2T1/T1→DWI transform matrix from .dat file.
 
     Strategy:
       1) Look for the first 4×4 float block (4 consecutive lines, 4 floats each).
       2) If not found, fall back to scraping numeric tokens.
 
-    Returns:
-        trans_M: 4×4 numpy array (transposed to match MATLAB code).
+    IMPORTANT: We now treat the 4×4 as already in the correct
+    row-major arrangement and DO NOT transpose it. Transposing
+    was turning an affine into a projective-like transform and
+    blowing voxel indices up to ~1e4–1e5.
     """
     M = _find_first_4x4_block(dat_path)
     if M is not None:
@@ -210,9 +217,9 @@ def load_trans_M(dat_path: Path) -> np.ndarray:
         print("[PARSE] Scraped 4×4 block:")
         print(M)
 
-    # MATLAB: trans_M = reshape(...,[4,4])';
-    trans_M = M.T
-    print("[PARSE] Final trans_M (after transpose):")
+    # NO TRANSPOSE HERE.
+    trans_M = M
+    print("[PARSE] Final trans_M (NO transpose applied):")
     print(trans_M)
     return trans_M
 
