@@ -11,56 +11,28 @@ Wrapper to process ONE subject/ID through the full column/thickness pipeline:
     3) build_pairs_from_freesurfer.py
     4) get_thickness.py
 
-Assumed function signatures:
-
-    vertices_connect.vertices_connect(
-        ID: str,
-        root_dir,
-        voldim=(512, 512, 272),
-        voxres=(0.5, 0.5, 0.5),
-    )
-
-    coordinates_in_regions_oneMM_DD.coordinates_in_regions_oneMM_DD(
-        ID: str,
-        output_dir,
-    )
-
-    get_columns_in_regions_oneMM_DD.get_columns_in_regions_oneMM_DD(
-        ID: str,
-        input_dir,
-        output_dir,
-        contrast: str,
-        force: bool = False,
-    )
-
-    build_pairs_from_freesurfer.build_pairs_from_freesurfer(
-        ID: str,
-        output_dir,
-        force: bool = False,
-    )
-
-    get_thickness.get_thickness(
-        ID: str,
-        output_dir,
-        force: bool = False,
-    )
-
 Conventions
 -----------
 
-- `output_dir` is the root that contains FreeSurfer + columns + all
-  geometry-based outputs:
+- `output_dir` is the root that contains:
 
-      <output_dir>/<ID>/surf/...
       <output_dir>/<ID>/DWI2T1_dti_upsampled.dat
       <output_dir>/<ID>/columns/...
       <output_dir>/<ID>/<ID>/label/...
+
+- FreeSurfer surfaces come from a possibly separate FS subjects dir:
+
+      <fs_subjects_dir>/<ID>/surf/lh.white, etc.
+
+  which can be:
+      * provided via --fs-subjects-dir
+      * or read from $SUBJECTS_DIR
+      * or, if neither is set, defaulted to output_dir (legacy behavior)
 
 - `input_dir` is where the MRI contrast images live, e.g.:
 
       <input_dir>/<ID>/<ID>_<contrast>_masked.nii.gz
       <input_dir>/<ID>_<contrast>_masked.nii.gz
-      (plus unmasked)
 
 - Column cp_dwi & region coords are contrast-independent and live under:
 
@@ -87,6 +59,7 @@ def run_subject_pipeline(
     input_dir,
     output_dir,
     contrasts,
+    fs_subjects_dir=None,
     force_all: bool = False,
     nproc_coords: int = 1,  # reserved; currently unused
 ):
@@ -100,14 +73,16 @@ def run_subject_pipeline(
     input_dir : str or Path
         Root for contrast images (QSM, MD, FA, etc.).
     output_dir : str or Path
-        Root for FreeSurfer subjects, columns, and all downstream outputs.
+        Root for FreeSurfer/columns/output products (DWI2T1 transform, columns, labels, etc.).
     contrasts : list of str
         List of contrast names to sample (e.g., ["QSM", "MD", "FA"]).
+    fs_subjects_dir : str or Path, optional
+        FreeSurfer subjects root containing <ID>/surf.
+        If None, vertices_connect will use $SUBJECTS_DIR or fallback to output_dir.
     force_all : bool
         If True, passed through to downstream steps that support --force.
     nproc_coords : int
-        Reserved; currently unused but kept in signature to avoid breaking
-        existing CLI calls.
+        Reserved; currently unused.
     """
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
@@ -117,6 +92,7 @@ def run_subject_pipeline(
     print(f"[SUBJECT]        {ID}")
     print(f"[INPUT DIR]      {input_dir}")
     print(f"[OUTPUT DIR]     {output_dir}")
+    print(f"[FS SUBJECTS DIR]{' ' if fs_subjects_dir is None else ''}{fs_subjects_dir}")
     print(f"[CONTRASTS]      {', '.join(contrasts)}")
     print(f"[FORCE ALL]      {force_all}")
     print(f"[NPROC COORDS]   {nproc_coords} (reserved)")
@@ -132,7 +108,8 @@ def run_subject_pipeline(
     vertices_connect(
         ID=ID,
         root_dir=output_dir,
-        # voldim/voxres are defaulted; expose via CLI if needed
+        fs_subjects_dir=fs_subjects_dir,
+        # voldim/voxres are defaulted inside vertices_connect
     )
 
     # ------------------------------------------------------------
@@ -207,13 +184,19 @@ def _cli():
     parser.add_argument(
         "--output-dir",
         required=True,
-        help="Root for FreeSurfer data, columns, and all pipeline outputs.",
+        help="Root for FreeSurfer/columns/outputs (contains <ID>/DWI2T1_dti_upsampled.dat, <ID>/columns, <ID>/<ID>/label).",
+    )
+    parser.add_argument(
+        "--fs-subjects-dir",
+        default=None,
+        help="FreeSurfer SUBJECTS_DIR-style root containing <ID>/surf. "
+             "If omitted, vertices_connect uses $SUBJECTS_DIR or falls back to --output-dir.",
     )
     parser.add_argument(
         "--contrasts",
         nargs="+",
         required=True,
-        help="One or more contrast names to process (e.g. QSM MD FA).",
+        help="One or more contrast names to process (e.g. adc ad fa rd).",
     )
     parser.add_argument(
         "--force-all",
@@ -234,6 +217,7 @@ def _cli():
         input_dir=args.input_dir,
         output_dir=args.output_dir,
         contrasts=args.contrasts,
+        fs_subjects_dir=args.fs_subjects_dir,
         force_all=args.force_all,
         nproc_coords=args.nproc_coords,
     )
