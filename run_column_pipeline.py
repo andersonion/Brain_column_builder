@@ -16,7 +16,7 @@ Conventions
 
 - `output_dir` is the root that contains:
 
-      <output_dir>/<ID>/DWI2T1_dti_upsampled.dat
+      <output_dir>/<ID>/DWI2T1_dti_*.dat  (or other transform .dat)
       <output_dir>/<ID>/columns/...
       <output_dir>/<ID>/<ID>/surf/...
       <output_dir>/<ID>/<ID>/label/...
@@ -51,6 +51,7 @@ def run_subject_pipeline(
     input_dir,
     output_dir,
     contrasts,
+    transform_file: str | None = None,
     force_all: bool = False,
     nproc_coords: int = 1,  # reserved; currently unused
 ):
@@ -67,6 +68,9 @@ def run_subject_pipeline(
         Root for FreeSurfer/columns/output products.
     contrasts : list of str
         List of contrast names to sample (e.g., ["adc", "ad", "fa", "rd"]).
+    transform_file : str or None
+        Optional transform .dat filename inside <output_dir>/<ID>.
+        If None, vertices_connect will auto-detect as described in its doc.
     force_all : bool
         If True, passed through to downstream steps that support --force.
     nproc_coords : int
@@ -80,6 +84,7 @@ def run_subject_pipeline(
     print(f"[SUBJECT]        {ID}")
     print(f"[INPUT DIR]      {input_dir}")
     print(f"[OUTPUT DIR]     {output_dir}")
+    print(f"[TRANSFORM FILE] {transform_file if transform_file else '(auto-detect)'}")
     print(f"[CONTRASTS]      {', '.join(contrasts)}")
     print(f"[FORCE ALL]      {force_all}")
     print(f"[NPROC COORDS]   {nproc_coords} (reserved)")
@@ -95,6 +100,7 @@ def run_subject_pipeline(
     vertices_connect(
         ID=ID,
         root_dir=output_dir,
+        transform_file=transform_file,
         # voldim/voxres use defaults inside vertices_connect
     )
 
@@ -171,13 +177,19 @@ def _cli():
         "--output-dir",
         required=True,
         help="Root for FreeSurfer/columns/outputs "
-             "(contains <ID>/DWI2T1_dti_upsampled.dat and <ID>/<ID>/surf).",
+             "(contains <ID>/, <ID>/<ID>/surf, and transform .dat).",
     )
     parser.add_argument(
         "--contrasts",
         nargs="+",
         required=True,
         help="One or more contrast names to process (e.g. adc ad fa rd).",
+    )
+    parser.add_argument(
+        "--transform-file",
+        default=None,
+        help="Optional transform .dat filename inside <output-dir>/<ID>. "
+             "If omitted, vertices_connect will auto-detect.",
     )
     parser.add_argument(
         "--force-all",
@@ -198,6 +210,7 @@ def _cli():
         input_dir=args.input_dir,
         output_dir=args.output_dir,
         contrasts=args.contrasts,
+        transform_file=args.transform_file,
         force_all=args.force_all,
         nproc_coords=args.nproc_coords,
     )

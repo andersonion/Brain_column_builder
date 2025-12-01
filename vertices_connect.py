@@ -12,8 +12,8 @@ Assumed directory layout
 We assume a per-subject layout like:
 
     <root_dir>/<ID>/
-        DWI2T1_dti_upsampled.dat
-        columns/              (created by this script)
+        DWI2T1_dti_*.dat         (or some other transform .dat file)
+        columns/                 (created by this script)
         <ID>/
             surf/
                 lh.white
@@ -26,6 +26,27 @@ We assume a per-subject layout like:
 
 So FreeSurfer-style surfaces live under `<root_dir>/<ID>/<ID>/surf`,
 while this script writes its outputs under `<root_dir>/<ID>/columns`.
+
+Transform file flexibility
+--------------------------
+
+By default we try to locate a transform .dat file inside `<root_dir>/<ID>`:
+
+Priority order:
+
+    1) DWI2T1_dti_upsampled.dat
+    2) <ID>_DWI2T1_dti_upsampled.dat
+    3) DWI2T1_dti.dat
+    4) <ID>_DWI2T1_dti.dat
+    5) Any single *.dat file in <root_dir>/<ID>
+
+If multiple .dat files exist and none of the preferred names are found,
+we raise an error listing candidates and suggest specifying
+--transform-file explicitly.
+
+You can override auto-detection with:
+
+    --transform-file SOME_NAME.dat
 
 Outputs
 -------
@@ -178,11 +199,69 @@ def load_trans_M(dat_path: Path) -> np.ndarray:
     return trans_M
 
 
+def find_transform_file(subj_dir: Path, ID: str, transform_file: str | None) -> Path:
+    """
+    Determine which transform .dat file to use.
+
+    If `transform_file` is not None, we require that:
+        subj_dir / transform_file
+    exists.
+
+    Otherwise, we try a priority-ordered list of common names, then fall back
+    to a single *.dat file in subj_dir. If multiple .dat files exist and none
+    of the preferred names are found, we raise an error listing candidates.
+    """
+    if transform_file is not None:
+        candidate = subj_dir / transform_file
+        if not candidate.is_file():
+            raise FileNotFoundError(
+                f"Requested transform file not found:\n  {candidate}"
+            )
+        print(f"[TRANS] Using explicitly specified transform file: {candidate}")
+        return candidate
+
+    # Priority candidates
+    candidates = [
+        subj_dir / "DWI2T1_dti_upsampled.dat",
+        subj_dir / f"{ID}_DWI2T1_dti_upsampled.dat",
+        subj_dir / "DWI2T1_dti.dat",
+        subj_dir / f"{ID}_DWI2T1_dti.dat",
+    ]
+
+    for c in candidates:
+        if c.is_file():
+            print(f"[TRANS] Using transform file: {c}")
+            return c
+
+    # Fallback to any *.dat
+    dats = sorted(subj_dir.glob("*.dat"))
+    if len(dats) == 1:
+        print(f"[TRANS] Using sole .dat file in {subj_dir}: {dats[0]}")
+        return dats[0]
+    elif len(dats) > 1:
+        msg_lines = [
+            f"No preferred transform filename found in {subj_dir}.",
+            "Multiple .dat files detected, cannot auto-resolve:",
+        ]
+        for d in dats:
+            msg_lines.append(f"  - {d.name}")
+        msg_lines.append(
+            "Please rerun with --transform-file <name> to specify which one to use."
+        )
+        raise FileNotFoundError("\n".join(msg_lines))
+    else:
+        raise FileNotFoundError(
+            f"No transform .dat file found in {subj_dir}. "
+            f"Expected e.g. DWI2T1_dti.dat or DWI2T1_dti_upsampled.dat."
+        )
+
+
 # ----------------- Main worker ----------------- #
 
 def vertices_connect(
     ID: str,
     root_dir,
+    transform_file: str | None = None,
     voldim=(512, 512, 272),
     voxres=(0.5, 0.5, 0.5),
 ):
@@ -197,10 +276,14 @@ def vertices_connect(
     root_dir : str or Path
         Root directory for outputs + transform, containing:
 
-            <root_dir>/<ID>/DWI2T1_dti_upsampled.dat
+            <root_dir>/<ID>/DWI2T1_dti_*.dat (or other .dat)
             <root_dir>/<ID>/columns/...
             <root_dir>/<ID>/<ID>/surf/...
 
+    transform_file : str or None
+        Optional specific filename of the transform .dat (relative to
+        <root_dir>/<ID>). If None (default), we auto-detect as described
+        in find_transform_file().
     voldim : (Nx, Ny, Nz)
         Volume dimensions for T_mov (default: [512, 512, 272])
     voxres : (dx, dy, dz)
@@ -208,12 +291,12 @@ def vertices_connect(
     """
     root_dir = Path(root_dir)
     subj_dir = root_dir / ID
-    subj_fs_dir = subj_dir / ID          # this is the extra ID layer
+    subj_fs_dir = subj_dir / ID          # the extra ID layer
     surf_dir = subj_fs_dir / "surf"
     columns_dir = subj_dir / "columns"
     columns_dir.mkdir(parents=True, exist_ok=True)
 
-    trans_M_path = subj_dir / "DWI2T1_dti_upsampled.dat"
+    trans_M_path = find_transform_file(subj_dir, ID, transform_file)
 
     print("\n[INFO] Subject:", ID)
     print("[INFO] Root dir (outputs/transform):", root_dir)
@@ -232,10 +315,6 @@ def vertices_connect(
     for p in [lh_white_path, lh_pial_path, rh_white_path, rh_pial_path]:
         if not p.is_file():
             raise FileNotFoundError(f"Missing surface file: {p}")
-
-    # ---- Transform path ----
-    if not trans_M_path.is_file():
-        raise FileNotFoundError(f"Missing transform file: {trans_M_path}")
 
     # ========================
     # 1) Load surfaces
@@ -345,7 +424,7 @@ def vertices_connect(
         # white_vertices: (N,3)
         v = white_vertices.T  # (3,N)
         v_h = np.vstack([v, np.ones((1, v.shape[1]), dtype=float)])  # (4,N)
-        v_t = trans_M @ v_h   # (4,N)   (MATLAB: lh_white_f = trans_M * lh_white_f)
+        v_t = trans_M @ v_h   # (4,N)
         return v_t[0:3, :].T  # (N,3)
 
     lh_white_t = _transform_white(lh_white_vertices)
@@ -373,7 +452,13 @@ def _cli():
     parser.add_argument(
         "--root-dir",
         required=True,
-        help="Root dir for outputs and transform (contains <ID>/DWI2T1_dti_upsampled.dat and <ID>/<ID>/surf).",
+        help="Root dir for outputs and transform (contains <ID>/ and <ID>/<ID>/surf).",
+    )
+    parser.add_argument(
+        "--transform-file",
+        default=None,
+        help="Optional filename of transform .dat inside <root-dir>/<ID>. "
+             "If omitted, script will auto-detect from *.dat files.",
     )
     parser.add_argument(
         "--voldim",
@@ -395,6 +480,7 @@ def _cli():
     vertices_connect(
         ID=args.ID,
         root_dir=args.root_dir,
+        transform_file=args.transform_file,
         voldim=args.voldim,
         voxres=args.voxres,
     )
