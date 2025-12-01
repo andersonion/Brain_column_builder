@@ -43,9 +43,6 @@ Priority order:
 You can override with:
 
     --transform-file my_transform.dat
-
-We now explicitly support FreeSurfer LTA-style files by looking for a
-line "1 4 4" and taking the next 4 lines as the 4×4 matrix.
 """
 
 import argparse
@@ -109,64 +106,44 @@ def columns_to_cp_matrix(column_points: np.ndarray) -> np.ndarray:
     return column_points.T  # (3, N)
 
 
-def _try_load_lta_matrix(dat_path: Path) -> np.ndarray | None:
+def _find_first_4x4_block(dat_path: Path) -> np.ndarray | None:
     """
-    Try to parse dat_path as a FreeSurfer LTA file.
-
-    We look for a line that parses as "1 4 4" (nxforms, nrows, ncols).
-    The next 4 lines should be the 4×4 matrix (4 floats per line).
+    Look for the first group of 4 consecutive lines that each contain
+    at least 4 float-like tokens. Treat that as a 4×4 matrix.
 
     Returns:
-        4×4 numpy array if successful, else None.
+        4×4 numpy array if found, else None.
     """
     lines = dat_path.read_text().splitlines()
     n = len(lines)
 
-    for idx, line in enumerate(lines):
-        parts = line.strip().split()
-        if len(parts) != 3:
-            continue
-        try:
-            nums = [int(p) for p in parts]
-        except ValueError:
-            continue
+    for start in range(0, n - 3):
+        block = lines[start:start + 4]
+        rows = []
+        ok = True
+        for line in block:
+            parts = line.strip().replace(",", " ").split()
+            if len(parts) < 4:
+                ok = False
+                break
+            try:
+                vals = [float(p) for p in parts[:4]]
+            except ValueError:
+                ok = False
+                break
+            rows.append(vals)
 
-        if nums == [1, 4, 4]:
-            # Next 4 lines should be the matrix
-            if idx + 4 >= n:
-                raise ValueError(
-                    f"LTA-like header '1 4 4' found in {dat_path} "
-                    "but fewer than 4 lines follow for the matrix."
-                )
+        if ok and len(rows) == 4:
+            M = np.array(rows, dtype=float)
+            if M.shape == (4, 4):
+                return M
 
-            mat_rows = []
-            for j in range(1, 5):
-                row_parts = lines[idx + j].strip().split()
-                if len(row_parts) < 4:
-                    raise ValueError(
-                        f"Expected 4 floats on line {idx + j + 1} of {dat_path}, "
-                        f"got: {lines[idx + j]!r}"
-                    )
-                try:
-                    row_vals = [float(v) for v in row_parts[:4]]
-                except ValueError as e:
-                    raise ValueError(
-                        f"Could not parse numeric row in {dat_path} at line {idx + j + 1}"
-                    ) from e
-                mat_rows.append(row_vals)
-
-            M = np.array(mat_rows, dtype=float)
-            if M.shape != (4, 4):
-                raise ValueError(f"Parsed LTA matrix has shape {M.shape}, expected (4,4)")
-            return M
-
-    # No LTA pattern found
     return None
 
 
 def _fallback_load_matrix(dat_path: Path) -> np.ndarray:
     """
-    Fallback: scrape all numeric tokens and construct a 4×4.
+    Fallback: scrape all numeric tokens and construct a 4×4 matrix.
 
     This mimics the old importdata-based behavior but is less strict.
     """
@@ -205,21 +182,17 @@ def load_trans_M(dat_path: Path) -> np.ndarray:
     """
     Load DWI2T1 transform matrix from .dat file.
 
-    Priority:
-      1) Interpret as FreeSurfer LTA: find '1 4 4' and read next 4 lines.
-      2) Fallback to numeric token scraping.
+    Strategy:
+      1) Look for the first 4×4 float block (4 consecutive lines, 4 floats each).
+      2) If not found, fall back to scraping numeric tokens.
 
     Returns:
-        trans_M: 4×4 numpy array (we then transpose to match MATLAB code).
+        trans_M: 4×4 numpy array (transposed to match MATLAB code).
     """
-    # First try LTA-style parsing
-    M = _try_load_lta_matrix(dat_path)
-    if M is not None:
-        trans_M = M.T  # MATLAB had a final transpose
-        return trans_M
+    M = _find_first_4x4_block(dat_path)
+    if M is None:
+        M = _fallback_load_matrix(dat_path)
 
-    # Fallback
-    M = _fallback_load_matrix(dat_path)
     trans_M = M.T
     return trans_M
 
