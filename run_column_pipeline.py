@@ -18,16 +18,8 @@ Conventions
 
       <output_dir>/<ID>/DWI2T1_dti_upsampled.dat
       <output_dir>/<ID>/columns/...
+      <output_dir>/<ID>/<ID>/surf/...
       <output_dir>/<ID>/<ID>/label/...
-
-- FreeSurfer surfaces come from a possibly separate FS subjects dir:
-
-      <fs_subjects_dir>/<ID>/surf/lh.white, etc.
-
-  which can be:
-      * provided via --fs-subjects-dir
-      * or read from $SUBJECTS_DIR
-      * or, if neither is set, defaulted to output_dir (legacy behavior)
 
 - `input_dir` is where the MRI contrast images live, e.g.:
 
@@ -59,7 +51,6 @@ def run_subject_pipeline(
     input_dir,
     output_dir,
     contrasts,
-    fs_subjects_dir=None,
     force_all: bool = False,
     nproc_coords: int = 1,  # reserved; currently unused
 ):
@@ -69,16 +60,13 @@ def run_subject_pipeline(
     Parameters
     ----------
     ID : str
-        Subject ID (e.g., S00775).
+        Subject ID (e.g., D0007).
     input_dir : str or Path
         Root for contrast images (QSM, MD, FA, etc.).
     output_dir : str or Path
-        Root for FreeSurfer/columns/output products (DWI2T1 transform, columns, labels, etc.).
+        Root for FreeSurfer/columns/output products.
     contrasts : list of str
-        List of contrast names to sample (e.g., ["QSM", "MD", "FA"]).
-    fs_subjects_dir : str or Path, optional
-        FreeSurfer subjects root containing <ID>/surf.
-        If None, vertices_connect will use $SUBJECTS_DIR or fallback to output_dir.
+        List of contrast names to sample (e.g., ["adc", "ad", "fa", "rd"]).
     force_all : bool
         If True, passed through to downstream steps that support --force.
     nproc_coords : int
@@ -92,7 +80,6 @@ def run_subject_pipeline(
     print(f"[SUBJECT]        {ID}")
     print(f"[INPUT DIR]      {input_dir}")
     print(f"[OUTPUT DIR]     {output_dir}")
-    print(f"[FS SUBJECTS DIR]{' ' if fs_subjects_dir is None else ''}{fs_subjects_dir}")
     print(f"[CONTRASTS]      {', '.join(contrasts)}")
     print(f"[FORCE ALL]      {force_all}")
     print(f"[NPROC COORDS]   {nproc_coords} (reserved)")
@@ -108,8 +95,7 @@ def run_subject_pipeline(
     vertices_connect(
         ID=ID,
         root_dir=output_dir,
-        fs_subjects_dir=fs_subjects_dir,
-        # voldim/voxres are defaulted inside vertices_connect
+        # voldim/voxres use defaults inside vertices_connect
     )
 
     # ------------------------------------------------------------
@@ -175,7 +161,7 @@ def _cli():
     parser = argparse.ArgumentParser(
         description="Wrapper to run full cortical column / thickness pipeline for one subject."
     )
-    parser.add_argument("--ID", required=True, help="Subject ID, e.g. S00775")
+    parser.add_argument("--ID", required=True, help="Subject ID, e.g. D0007")
     parser.add_argument(
         "--input-dir",
         required=True,
@@ -184,13 +170,8 @@ def _cli():
     parser.add_argument(
         "--output-dir",
         required=True,
-        help="Root for FreeSurfer/columns/outputs (contains <ID>/DWI2T1_dti_upsampled.dat, <ID>/columns, <ID>/<ID>/label).",
-    )
-    parser.add_argument(
-        "--fs-subjects-dir",
-        default=None,
-        help="FreeSurfer SUBJECTS_DIR-style root containing <ID>/surf. "
-             "If omitted, vertices_connect uses $SUBJECTS_DIR or falls back to --output-dir.",
+        help="Root for FreeSurfer/columns/outputs "
+             "(contains <ID>/DWI2T1_dti_upsampled.dat and <ID>/<ID>/surf).",
     )
     parser.add_argument(
         "--contrasts",
@@ -217,7 +198,6 @@ def _cli():
         input_dir=args.input_dir,
         output_dir=args.output_dir,
         contrasts=args.contrasts,
-        fs_subjects_dir=args.fs_subjects_dir,
         force_all=args.force_all,
         nproc_coords=args.nproc_coords,
     )

@@ -6,36 +6,29 @@ vertices_connect.py
 Connect FreeSurfer white and pial vertices into cortical columns,
 sample points along those columns, and transform them into DWI CRS space.
 
-Original MATLAB behavior:
+Assumed directory layout
+------------------------
 
-    output_dir = '/.../ad_decode_test/output/';
-    ID = 'S04491';
-    lh_white = strcat(output_dir,ID,'/surf/lh.white');
-    lh_pial  = strcat(output_dir,ID,'/surf/lh.pial');
-    rh_white = strcat(output_dir,ID,'/surf/rh.white');
-    rh_pial  = strcat(output_dir,ID,'/surf/rh.pial');
-    trans_M_dir = strcat(output_dir,ID,'/DWI2T1_dti_upsampled.dat');
+We assume a per-subject layout like:
 
-In this Python version we **decouple** the locations:
+    <root_dir>/<ID>/
+        DWI2T1_dti_upsampled.dat
+        columns/              (created by this script)
+        <ID>/
+            surf/
+                lh.white
+                lh.pial
+                rh.white
+                rh.pial
+            label/
+                lh.aparc.annot
+                rh.aparc.annot
 
-    - FreeSurfer surfaces come from a FreeSurfer subjects dir:
+So FreeSurfer-style surfaces live under `<root_dir>/<ID>/<ID>/surf`,
+while this script writes its outputs under `<root_dir>/<ID>/columns`.
 
-          <fs_subjects_dir>/<ID>/surf/lh.white
-          <fs_subjects_dir>/<ID>/surf/lh.pial
-          <fs_subjects_dir>/<ID>/surf/rh.white
-          <fs_subjects_dir>/<ID>/surf/rh.pial
-
-      where fs_subjects_dir is either:
-          * explicitly passed, or
-          * taken from $SUBJECTS_DIR, or
-          * falls back to root_dir (for legacy layout).
-
-    - Column and transform files live under root_dir:
-
-          <root_dir>/<ID>/DWI2T1_dti_upsampled.dat
-          <root_dir>/<ID>/columns/...
-
-Outputs:
+Outputs
+-------
 
     <root_dir>/<ID>/columns/<ID>_pair_lh.mat
     <root_dir>/<ID>/columns/<ID>_pair_rh.mat
@@ -48,7 +41,6 @@ Outputs:
 """
 
 import argparse
-import os
 from pathlib import Path
 
 import numpy as np
@@ -143,10 +135,7 @@ def generate_inner_points(pair: np.ndarray, points_num: int) -> np.ndarray:
 
 def columns_to_cp_matrix(column_points: np.ndarray) -> np.ndarray:
     """
-    Convert column_points (N*points_num, 3) into a 3×(N*points_num) matrix,
-    as used by the rest of the pipeline.
-
-    Here we simply transpose:
+    Convert column_points (N*points_num, 3) into a 3×(N*points_num) matrix.
 
         column_points: (N*points_num, 3)
         -> (3, N*points_num)
@@ -194,7 +183,6 @@ def load_trans_M(dat_path: Path) -> np.ndarray:
 def vertices_connect(
     ID: str,
     root_dir,
-    fs_subjects_dir=None,
     voldim=(512, 512, 272),
     voxres=(0.5, 0.5, 0.5),
 ):
@@ -205,18 +193,13 @@ def vertices_connect(
     Parameters
     ----------
     ID : str
-        Subject ID, e.g. 'S04491'.
+        Subject ID, e.g. 'D0007'.
     root_dir : str or Path
-        Root directory for **output products** and transform file, containing:
+        Root directory for outputs + transform, containing:
 
             <root_dir>/<ID>/DWI2T1_dti_upsampled.dat
             <root_dir>/<ID>/columns/...
-
-    fs_subjects_dir : str or Path, optional
-        FreeSurfer SUBJECTS_DIR-like root containing <ID>/surf.
-        If None:
-            - If $SUBJECTS_DIR is set, use that.
-            - Else, fall back to root_dir (legacy behavior).
+            <root_dir>/<ID>/<ID>/surf/...
 
     voldim : (Nx, Ny, Nz)
         Volume dimensions for T_mov (default: [512, 512, 272])
@@ -224,30 +207,21 @@ def vertices_connect(
         Voxel resolution for T_mov (default: [0.5, 0.5, 0.5])
     """
     root_dir = Path(root_dir)
-
-    if fs_subjects_dir is None:
-        env_sd = os.getenv("SUBJECTS_DIR")
-        if env_sd:
-            fs_subjects_dir = Path(env_sd)
-        else:
-            fs_subjects_dir = root_dir
-    else:
-        fs_subjects_dir = Path(fs_subjects_dir)
-
-    subj_fs_dir = fs_subjects_dir / ID
+    subj_dir = root_dir / ID
+    subj_fs_dir = subj_dir / ID          # this is the extra ID layer
     surf_dir = subj_fs_dir / "surf"
-
-    columns_dir = root_dir / ID / "columns"
+    columns_dir = subj_dir / "columns"
     columns_dir.mkdir(parents=True, exist_ok=True)
 
-    trans_M_path = root_dir / ID / "DWI2T1_dti_upsampled.dat"
+    trans_M_path = subj_dir / "DWI2T1_dti_upsampled.dat"
 
     print("\n[INFO] Subject:", ID)
     print("[INFO] Root dir (outputs/transform):", root_dir)
-    print("[INFO] FS subjects dir:             ", fs_subjects_dir)
+    print("[INFO] Subject dir:                 ", subj_dir)
     print("[INFO] FS subject dir:              ", subj_fs_dir)
     print("[INFO] Surf dir:                    ", surf_dir)
     print("[INFO] Columns dir:                 ", columns_dir)
+    print("[INFO] Transform path:              ", trans_M_path)
 
     # ---- Surface paths ----
     lh_white_path = surf_dir / "lh.white"
@@ -395,17 +369,11 @@ def _cli():
     parser = argparse.ArgumentParser(
         description="Connect white/pial vertices into columns and transform to DWI CRS."
     )
-    parser.add_argument("--ID", required=True, help="Subject ID, e.g. S04491")
+    parser.add_argument("--ID", required=True, help="Subject ID, e.g. D0007")
     parser.add_argument(
         "--root-dir",
         required=True,
-        help="Root dir for outputs and transform (contains <ID>/DWI2T1_dti_upsampled.dat).",
-    )
-    parser.add_argument(
-        "--fs-subjects-dir",
-        default=None,
-        help="FreeSurfer SUBJECTS_DIR-style root containing <ID>/surf. "
-             "If omitted, uses $SUBJECTS_DIR or falls back to root-dir.",
+        help="Root dir for outputs and transform (contains <ID>/DWI2T1_dti_upsampled.dat and <ID>/<ID>/surf).",
     )
     parser.add_argument(
         "--voldim",
@@ -427,7 +395,6 @@ def _cli():
     vertices_connect(
         ID=args.ID,
         root_dir=args.root_dir,
-        fs_subjects_dir=args.fs_subjects_dir,
         voldim=args.voldim,
         voxres=args.voxres,
     )
