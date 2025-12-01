@@ -46,7 +46,7 @@ we raise an error listing candidates and suggest specifying
 
 You can override auto-detection with:
 
-    --transform-file SOME_NAME.dat
+    --transform-file my_transform.dat
 
 Outputs
 -------
@@ -111,11 +111,10 @@ def vox2ras_0to1(M):
     """
     Convert a vox2ras-tkreg matrix from 0-based to 1-based indexing.
 
-    The MATLAB code uses: T_mov = vox2ras_tkreg(...); T_mov = vox2ras_0to1(T_mov);
-    Here we implement a standard shift by +0.5 voxels in each dimension.
+    Implemented as a shift by -0.5 in voxel indices, effectively moving
+    from voxel corners to centers.
 
-    R1 = M * ([I  -0.5; 0 1]), effectively moving from indices centered
-    at voxel corners to voxel centers.
+    R1 = M * ([I  -0.5; 0 1])
     """
     shift = np.eye(4, dtype=float)
     shift[0:3, 3] = -0.5
@@ -170,26 +169,51 @@ def columns_to_cp_matrix(column_points: np.ndarray) -> np.ndarray:
 
 def load_trans_M(dat_path: Path) -> np.ndarray:
     """
-    Load DWI2T1 transform matrix from a .dat file, mimicking:
+    Load DWI2T1 transform matrix from a .dat file in a robust way.
+
+    Many of these .dat files have mixed headers / strings (e.g. IDs, labels)
+    plus numeric blocks. The original MATLAB code used something like:
 
         data = importdata(trans_M_dir);
         trans_M = data.data(4:19);
         trans_M = reshape(trans_M,[4, 4])';
 
     Here we:
-        - load all numeric values,
-        - take elements [3:19] (0-based),
-        - reshape 4×4, transpose.
-    """
-    vals = np.loadtxt(str(dat_path), dtype=float)
-    vals = np.atleast_1d(vals).flatten()
 
-    if vals.size < 19:
+        1) Read the entire file as text.
+        2) Split into whitespace-separated tokens.
+        3) Attempt to convert each token to float; keep those that succeed.
+        4) If we have >= 19 floats, we take floats[3:19] (equivalent to 4:19).
+           Otherwise, if we have >= 16 floats, we take floats[0:16].
+        5) Reshape to 4×4 and transpose.
+
+    Raises:
+        ValueError if we cannot extract at least 16 numeric values.
+    """
+    text = dat_path.read_text()
+    tokens = text.replace(",", " ").split()
+
+    floats = []
+    for tok in tokens:
+        try:
+            val = float(tok)
+            floats.append(val)
+        except ValueError:
+            # ignore non-numeric tokens (e.g. 'D0007', 'row', etc.)
+            continue
+
+    floats = np.asarray(floats, dtype=float)
+
+    if floats.size >= 19:
+        trans_vals = floats[3:19]  # MATLAB 4:19 → zero-based 3:19
+    elif floats.size >= 16:
+        trans_vals = floats[0:16]
+    else:
         raise ValueError(
-            f"Expected at least 19 numeric values in {dat_path}, got {vals.size}"
+            f"Could not extract 16 numeric values from transform file {dat_path}.\n"
+            f"Found only {floats.size} numeric tokens."
         )
 
-    trans_vals = vals[3:19]  # MATLAB 4:19 → zero-based 3:19
     if trans_vals.size != 16:
         raise ValueError(
             f"Expected 16 values for trans_M, got {trans_vals.size} from {dat_path}"
