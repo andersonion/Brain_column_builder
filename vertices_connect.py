@@ -13,6 +13,7 @@ We assume a per-subject layout like:
 
     <root_dir>/<ID>/
         DWI2T1_dti_*.dat         (or some other transform .dat file)
+        <ID>_dwi_masked.nii.gz   (DWI volume used for transform)
         columns/                 (created by this script)
         <ID>/
             surf/
@@ -43,6 +44,10 @@ Priority order:
 You can override with:
 
     --transform-file my_transform.dat
+
+T_mov (vox2ras-tkreg) is computed from the *actual* DWI NIfTI if present:
+    <root_dir>/<ID>/<ID>_dwi_masked.nii.gz
+Otherwise we fall back to CLI voldim/voxres.
 """
 
 import argparse
@@ -50,6 +55,7 @@ from pathlib import Path
 
 import numpy as np
 from scipy.io import savemat
+import nibabel as nib
 import nibabel.freesurfer.io as fsio
 
 
@@ -204,8 +210,7 @@ def load_trans_M(dat_path: Path) -> np.ndarray:
         print("[PARSE] Scraped 4×4 block:")
         print(M)
 
-    # MATLAB code did: trans_M = reshape(...,[4,4])';
-    # So we transpose here as well.
+    # MATLAB: trans_M = reshape(...,[4,4])';
     trans_M = M.T
     print("[PARSE] Final trans_M (after transpose):")
     print(trans_M)
@@ -254,6 +259,43 @@ def find_transform_file(subj_dir: Path, ID: str, transform_file: str | None) -> 
             f"No transform .dat file found in {subj_dir}. "
             f"Expected e.g. DWI2T1_dti.dat or DWI2T1_dti_upsampled.dat."
         )
+
+
+def compute_T_mov(subj_dir: Path, ID: str, voldim_fallback, voxres_fallback):
+    """
+    Compute T_mov (DWI vox→RAS, 0->1) from the actual DWI NIfTI if possible.
+
+    Preferred:
+        <subj_dir>/<ID>_dwi_masked.nii.gz
+
+    Fallback:
+        use voldim_fallback / voxres_fallback from CLI.
+    """
+    candidates = [
+        subj_dir / f"{ID}_dwi_masked.nii.gz",
+        subj_dir / f"{ID}_dwi.nii.gz",
+    ]
+
+    for p in candidates:
+        if p.is_file():
+            print(f"[TRANS] Using mov NIfTI for T_mov: {p}")
+            nii = nib.load(str(p))
+            shape = nii.shape[:3]
+            zooms = nii.header.get_zooms()[:3]
+            print(f"[TRANS] mov shape={shape}, zooms={zooms}")
+            M = vox2ras_tkreg(shape, zooms)
+            M = vox2ras_0to1(M)
+            print("[TRANS] T_mov computed from mov NIfTI (vox2ras-tkreg, 0->1):")
+            print(M)
+            return M
+
+    print("[TRANS] No mov NIfTI found; falling back to CLI voldim/voxres.")
+    print(f"[TRANS] voldim={voldim_fallback}, voxres={voxres_fallback}")
+    M = vox2ras_tkreg(voldim_fallback, voxres_fallback)
+    M = vox2ras_0to1(M)
+    print("[TRANS] T_mov from fallback voldim/voxres (vox2ras-tkreg, 0->1):")
+    print(M)
+    return M
 
 
 # ----------------- Main worker ----------------- #
@@ -336,8 +378,7 @@ def vertices_connect(
     trans_M = load_trans_M(trans_M_path)
     print("[TRANS] trans_M (T1→DWI RAS) =\n", trans_M)
 
-    T_mov = vox2ras_tkreg(voldim, voxres)
-    T_mov = vox2ras_0to1(T_mov)
+    T_mov = compute_T_mov(subj_dir, ID, voldim, voxres)
     print("[TRANS] T_mov (DWI vox→RAS, 0->1) =\n", T_mov)
 
     T_mov_inv = np.linalg.inv(T_mov)
@@ -352,6 +393,18 @@ def vertices_connect(
     # original MATLAB: inv(T_mov) * trans_M * [col_RAS; 1]
     lh_cp_dwi = T_mov_inv @ (trans_M @ lh_cp_h)
     rh_cp_dwi = T_mov_inv @ (trans_M @ rh_cp_h)
+
+    # quick range debug
+    for name, arr in [("LH", lh_cp_dwi), ("RH", rh_cp_dwi)]:
+        i = arr[0, :]
+        j = arr[1, :]
+        k = arr[2, :]
+        print(
+            f"[DEBUG] {name} cp_dwi voxel coord ranges: "
+            f"i[min={i.min():.2f}, max={i.max():.2f}], "
+            f"j[min={j.min():.2f}, max={j.max():.2f}], "
+            f"k[min={k.min():.2f}, max={k.max():.2f}]"
+        )
 
     if np.isnan(lh_cp_dwi).any():
         print(f"[WARN] {ID} LH cp_dwi has NaN values")
@@ -409,14 +462,14 @@ def _cli():
         nargs=3,
         type=int,
         default=[512, 512, 272],
-        help="Volume dimensions (Nx Ny Nz) for T_mov (default: 512 512 272).",
+        help="Fallback volume dimensions (Nx Ny Nz) if mov NIfTI not found.",
     )
     parser.add_argument(
         "--voxres",
         nargs=3,
         type=float,
         default=[0.5, 0.5, 0.5],
-        help="Voxel resolution (dx dy dz) for T_mov (default: 0.5 0.5 0.5).",
+        help="Fallback voxel resolution (dx dy dz) if mov NIfTI not found.",
     )
 
     args = parser.parse_args()
