@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 """
 vertices_connect.py
@@ -59,6 +59,10 @@ POINTS_NUM = 21  # samples per column (including endpoints)
 # ----------------- FreeSurfer-style transforms ----------------- #
 
 def vox2ras_tkreg(voldim, voxres):
+    """
+    Approximate FreeSurfer vox2ras-tkreg transform for a given volume.
+    voldim: (Nx, Ny, Nz), voxres: (dx, dy, dz)
+    """
     nx, ny, nz = [float(v) for v in voldim]
     dx, dy, dz = [float(v) for v in voxres]
 
@@ -77,6 +81,10 @@ def vox2ras_tkreg(voldim, voxres):
 
 
 def vox2ras_0to1(M):
+    """
+    Convert a vox2ras-tkreg matrix from 0-based to 1-based indexing
+    by shifting coordinates by -0.5.
+    """
     shift = np.eye(4, dtype=float)
     shift[0:3, 3] = -0.5
     return M @ shift
@@ -85,6 +93,9 @@ def vox2ras_0to1(M):
 # ----------------- Helpers ----------------- #
 
 def generate_inner_points(pair: np.ndarray, points_num: int) -> np.ndarray:
+    """
+    Given white/pial pairs (N,6), generate column sample points (N*points_num,3).
+    """
     pair = np.asarray(pair, float)
     if pair.ndim != 2 or pair.shape[1] != 6:
         raise ValueError(f"pair must be (N,6), got {pair.shape}")
@@ -100,24 +111,24 @@ def generate_inner_points(pair: np.ndarray, points_num: int) -> np.ndarray:
 
 
 def columns_to_cp_matrix(column_points: np.ndarray) -> np.ndarray:
+    """
+    Convert column_points (N*points_num,3) into a 3×(N*points_num) matrix.
+    """
     column_points = np.asarray(column_points, float)
     if column_points.ndim != 2 or column_points.shape[1] != 3:
         raise ValueError(f"column_points must be (N*points_num, 3), got {column_points.shape}")
     return column_points.T  # (3, N)
 
 
-def _find_first_4x4_block(dat_path: Path) -> np.ndarray | None:
+def _find_first_4x4_block(dat_path: Path):
     """
-    Look for the first group of 4 consecutive lines that each contain
-    at least 4 float-like tokens. Treat that as a 4×4 matrix.
-
-    Returns:
-        4×4 numpy array if found, else None.
+    Look for the first 4 consecutive lines in the file that each contain
+    at least 4 float-like tokens. Interpret that as a 4×4 matrix.
     """
     lines = dat_path.read_text().splitlines()
     n = len(lines)
 
-    for start in range(0, n - 3):
+    for start in range(n - 3):
         block = lines[start:start + 4]
         rows = []
         ok = True
@@ -141,11 +152,11 @@ def _find_first_4x4_block(dat_path: Path) -> np.ndarray | None:
     return None
 
 
-def _fallback_load_matrix(dat_path: Path) -> np.ndarray:
+def _fallback_load_matrix(dat_path: Path):
     """
-    Fallback: scrape all numeric tokens and construct a 4×4 matrix.
-
-    This mimics the old importdata-based behavior but is less strict.
+    Fallback: scrape all numeric tokens in the file and take the 4×4
+    matrix from them, in a way roughly compatible with the old MATLAB
+    importdata(data.data(4:19)) behavior.
     """
     text = dat_path.read_text()
     tokens = text.replace(",", " ").split()
@@ -153,28 +164,22 @@ def _fallback_load_matrix(dat_path: Path) -> np.ndarray:
     floats = []
     for tok in tokens:
         try:
-            val = float(tok)
-            floats.append(val)
+            floats.append(float(tok))
         except ValueError:
-            continue
+            pass
 
     floats = np.asarray(floats, dtype=float)
+
     if floats.size >= 19:
-        trans_vals = floats[3:19]  # like MATLAB data.data(4:19)
+        vals = floats[3:19]   # 16 values
     elif floats.size >= 16:
-        trans_vals = floats[0:16]
+        vals = floats[:16]
     else:
         raise ValueError(
-            f"Could not extract 16 numeric values from {dat_path}; "
-            f"only found {floats.size} numeric tokens."
+            f"Could not extract 16 numbers from {dat_path}; found only {floats.size} tokens."
         )
 
-    if trans_vals.size != 16:
-        raise ValueError(
-            f"Expected 16 values for trans_M from {dat_path}, got {trans_vals.size}"
-        )
-
-    M = trans_vals.reshape((4, 4))
+    M = vals.reshape((4, 4))
     return M
 
 
@@ -190,14 +195,27 @@ def load_trans_M(dat_path: Path) -> np.ndarray:
         trans_M: 4×4 numpy array (transposed to match MATLAB code).
     """
     M = _find_first_4x4_block(dat_path)
-    if M is None:
+    if M is not None:
+        print("[PARSE] Found 4×4 block in transform file:")
+        print(M)
+    else:
+        print("[PARSE] No clean 4×4 block found; falling back to float scrape.")
         M = _fallback_load_matrix(dat_path)
+        print("[PARSE] Scraped 4×4 block:")
+        print(M)
 
+    # MATLAB code did: trans_M = reshape(...,[4,4])';
+    # So we transpose here as well.
     trans_M = M.T
+    print("[PARSE] Final trans_M (after transpose):")
+    print(trans_M)
     return trans_M
 
 
 def find_transform_file(subj_dir: Path, ID: str, transform_file: str | None) -> Path:
+    """
+    Decide which .dat file to use for the DWI↔T1 transform.
+    """
     if transform_file is not None:
         candidate = subj_dir / transform_file
         if not candidate.is_file():
@@ -247,6 +265,9 @@ def vertices_connect(
     voldim=(512, 512, 272),
     voxres=(0.5, 0.5, 0.5),
 ):
+    """
+    Build columns and DWI-space coordinates for one subject.
+    """
     root_dir = Path(root_dir)
     subj_dir = root_dir / ID
     subj_fs_dir = subj_dir / ID          # extra ID layer
@@ -313,11 +334,11 @@ def vertices_connect(
 
     print("\n[STEP 4] Load transform and build T_mov")
     trans_M = load_trans_M(trans_M_path)
-    print("[TRANS] trans_M (DWI2T1) =\n", trans_M)
+    print("[TRANS] trans_M (T1→DWI RAS) =\n", trans_M)
 
     T_mov = vox2ras_tkreg(voldim, voxres)
     T_mov = vox2ras_0to1(T_mov)
-    print("[TRANS] T_mov (vox2ras-tkreg, 0->1) =\n", T_mov)
+    print("[TRANS] T_mov (DWI vox→RAS, 0->1) =\n", T_mov)
 
     T_mov_inv = np.linalg.inv(T_mov)
 
@@ -328,6 +349,7 @@ def vertices_connect(
     lh_cp_h = np.vstack([lh_cp, np.ones((1, lh_cp.shape[1]), dtype=float)])
     rh_cp_h = np.vstack([rh_cp, np.ones((1, rh_cp.shape[1]), dtype=float)])
 
+    # original MATLAB: inv(T_mov) * trans_M * [col_RAS; 1]
     lh_cp_dwi = T_mov_inv @ (trans_M @ lh_cp_h)
     rh_cp_dwi = T_mov_inv @ (trans_M @ rh_cp_h)
 
@@ -363,6 +385,8 @@ def vertices_connect(
 
     print("\n[DONE] vertices_connect complete for", ID)
 
+
+# ----------------- CLI ----------------- #
 
 def _cli():
     parser = argparse.ArgumentParser(
