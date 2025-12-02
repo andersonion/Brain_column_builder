@@ -69,6 +69,42 @@ VMSTAT_PID=$!
 _debug_exist() { local p="$1"; [[ -e "$p" ]] && echo "EXISTS: $p" || echo "MISSING: $p"; }
 
 # -------------------------------
+# Column helper functions
+# -------------------------------
+# Normalize a contrast name to lowercase
+normalize_contrast() {
+  echo "$1" | tr '[:upper:]' '[:lower:]';
+}
+
+# Case-insensitive, regex-based check for a contrast file.
+# Matches filenames of the form:
+#   <runno>_<contrast>.nii.gz
+#   <runno>_<contrast>_anything.nii.gz
+# where <contrast> is strictly delimited by '_' before and '_' or '.' after.
+has_contrast_file() {
+  local runno="$1"
+  local contrast_raw="$2"
+  local dir="$3"
+
+  # Normalize contrast for regex consistency
+  local contrast
+  contrast="$(normalize_contrast "$contrast_raw")"
+
+  # Regex (case-insensitive via -iregex):
+  #   .*/<runno>_<contrast>.nii.gz
+  #   .*/<runno>_<contrast>_anything.nii.gz
+  # The character immediately after <contrast> must be '.' or '_' to avoid
+  # partial matches like 'ad' matching 'adc'.
+  local regex=".*/${runno}_${contrast}(\\.nii\\.gz|_[^/]*\\.nii\\.gz)"
+
+  if find "$dir" -maxdepth 1 -type f -iregex "$regex" -print -quit >/dev/null 2>&1; then
+    return 0  # found
+  else
+    return 1  # not found
+  fi
+}
+
+# -------------------------------
 # Run-specific dirs/files
 # -------------------------------
 diff_prep_dir="${WORK}/human/diffusion_prep_MRtrix_${runno}"
@@ -397,11 +433,13 @@ fi
 # -------------------------------------------------------------------
 # We expect:
 #   - Transform file at: ${output_dir}/${runno}/DWI2T1_dti.dat
-#   - Scalar maps at:    ${output_dir}/${runno}/${runno}_<contrast>.nii.gz
+#   - Scalar maps at:    ${output_dir}/${runno}/${runno}_<contrast>[...].nii.gz
+#       where <contrast> is strictly delimited by '_' before and '_' or '.' after.
 #   - FreeSurfer at:     ${output_dir}/${runno}/${runno}
 #
 # Contrasts behavior:
-#   - If COLUMN_CONTRASTS is set (space-separated), use exactly that list.
+#   - If COLUMN_CONTRASTS is set (space-separated), use exactly that list
+#     (normalized to lowercase) but only keep contrasts that have matching files.
 #       e.g. export COLUMN_CONTRASTS="fa adc ad rd qsm cbf"
 #   - Otherwise, auto-detect among: fa adc ad rd qsm cbf
 
@@ -415,23 +453,33 @@ else
   declare -a detected_contrasts=()
 
   if [[ -n "${COLUMN_CONTRASTS:-}" ]]; then
-    # Use user-specified contrasts verbatim
-    # Example: COLUMN_CONTRASTS="fa adc ad rd qsm cbf"
-    read -r -a detected_contrasts <<< "${COLUMN_CONTRASTS}"
-    echo "COLUMN_CONTRASTS provided externally: ${detected_contrasts[*]}"
+    echo "COLUMN_CONTRASTS requested: ${COLUMN_CONTRASTS}"
+    # Normalize and keep only those that actually have files
+    tmp_list=()
+    for c in ${COLUMN_CONTRASTS}; do
+      lc="$(normalize_contrast "$c")"
+      if has_contrast_file "${runno}" "${lc}" "${subject_map_dir}"; then
+        tmp_list+=("${lc}")
+      else
+        echo "WARNING: Requested contrast '${c}' (normalized '${lc}') not found for ${runno} in ${subject_map_dir}"
+      fi
+    done
+    detected_contrasts=("${tmp_list[@]}")
+    echo "COLUMN_CONTRASTS usable (after existence check): ${detected_contrasts[*]:-(none)}"
+
   else
-    # Auto-detect from maps actually present for this subject
+    # Auto-detect from candidate set (fa, adc, ad, rd, qsm, cbf)
     candidate_contrasts=(fa adc ad rd qsm cbf)
     for c in "${candidate_contrasts[@]}"; do
-      if [[ -s "${subject_map_dir}/${runno}_${c}.nii.gz" ]]; then
-        detected_contrasts+=("$c")
+      if has_contrast_file "${runno}" "${c}" "${subject_map_dir}"; then
+        detected_contrasts+=("${c}")
       fi
     done
     echo "Auto-detected contrasts for column pipeline: ${detected_contrasts[*]:-(none)}"
   fi
 
   if (( ${#detected_contrasts[@]} == 0 )); then
-    echo "NOTICE: Column pipeline skipped: no scalar maps found / specified for ${subject_map_dir}"
+    echo "NOTICE: Column pipeline skipped: no scalar maps found / usable for ${subject_map_dir}"
   else
     echo "Running column pipeline for ${runno}"
     echo "  Input root: ${column_input_root}"
