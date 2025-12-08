@@ -52,6 +52,31 @@ except ImportError:
 # Helpers
 ###############################################################################
 
+def resolve_subject_base(subjects_dir, subj):
+    """
+    Return the actual base directory that contains surf/ and label/.
+    Handles both:
+        subjects_dir/subj/
+        subjects_dir/subj/subj/
+    """
+    base1 = os.path.join(subjects_dir, subj)
+    surf1 = os.path.join(base1, "surf")
+    if os.path.isdir(surf1):
+        return base1
+
+    # Nested case: subjects_dir/subj/subj/surf
+    base2 = os.path.join(subjects_dir, subj, subj)
+    surf2 = os.path.join(base2, "surf")
+    if os.path.isdir(surf2):
+        return base2
+
+    raise FileNotFoundError(
+        f"Could not find surf/ for subject {subj}. Tried:\n"
+        f"  {surf1}\n"
+        f"  {surf2}"
+    )
+
+
 def farthest_point_sampling(coords, k, seed=None):
     """
     Quasi-uniform sampling using farthest-point sampling.
@@ -88,10 +113,13 @@ def farthest_point_sampling(coords, k, seed=None):
 
 def load_fs_hemi(subjects_dir, subj, hemi, surf_name="white", annot_name="aparc.annot"):
     """
-    Load surface coordinates and annotation for one hemisphere of one subject.
+    Load surface coordinates and annotation for one hemisphere of one subject,
+    handling possible nested subject directories.
     """
-    surf_path = os.path.join(subjects_dir, subj, "surf", f"{hemi}.{surf_name}")
-    annot_path = os.path.join(subjects_dir, subj, "label", f"{hemi}.{annot_name}")
+    base = resolve_subject_base(subjects_dir, subj)
+
+    surf_path = os.path.join(base, "surf", f"{hemi}.{surf_name}")
+    annot_path = os.path.join(base, "label", f"{hemi}.{annot_name}")
 
     if not os.path.exists(surf_path):
         raise FileNotFoundError(f"Missing surface file: {surf_path}")
@@ -101,10 +129,6 @@ def load_fs_hemi(subjects_dir, subj, hemi, surf_name="white", annot_name="aparc.
     coords, _ = nib.freesurfer.read_geometry(surf_path)
     labels, ctab, names = nib.freesurfer.read_annot(annot_path)
 
-    # coords: (N, 3)
-    # labels: (N,)
-    # ctab: (L, 5) with last column being the label value
-    # names: list of length L, bytes
     return coords.astype(np.float32), labels.astype(int), ctab, names
 
 
@@ -164,17 +188,17 @@ def build_k_table_multi(subjects, subjects_dir, frac, k_min, k_max,
         - Average these per-subject means across all subjects to get Nbar(region_name).
         - Compute k_r = round(frac * Nbar), clamp to [k_min, k_max].
     """
-    # For each subject: region_name -> list of hemisphere counts (lh/rh)
     per_subject_region_means = {}  # region_name -> list of subject-level means
 
-    # We will accumulate subject-level means here
     for subj in subjects:
         subj_counts = {}  # region_name -> list of [lh_count, rh_count, ...]
 
         for hemi in ("lh", "rh"):
-            coords, labels, ctab, names = load_fs_hemi(subjects_dir, subj, hemi,
-                                                       surf_name=surf_name,
-                                                       annot_name=annot_name)
+            coords, labels, ctab, names = load_fs_hemi(
+                subjects_dir, subj, hemi,
+                surf_name=surf_name,
+                annot_name=annot_name,
+            )
             value_to_name = make_label_value_to_name(ctab, names)
             hemi_counts = count_regions_by_name(labels, value_to_name)
 
@@ -183,14 +207,13 @@ def build_k_table_multi(subjects, subjects_dir, frac, k_min, k_max,
                     subj_counts[name] = []
                 subj_counts[name].append(n)
 
-        # Now compute one per-hemisphere mean for this subject for each region
+        # Compute per-subject mean across hemis for each region
         for name, vals in subj_counts.items():
-            subj_mean = float(np.mean(vals))  # average across hemis
+            subj_mean = float(np.mean(vals))
             if name not in per_subject_region_means:
                 per_subject_region_means[name] = []
             per_subject_region_means[name].append(subj_mean)
 
-    # Now compute across-subject Nbar and then k_r
     counts_mean = {}
     k_table = {}
 
@@ -236,7 +259,6 @@ def subsample_hemi_by_region_name(coords, labels, ctab, names, k_table, seed_off
             continue
 
         k = int(k_table[name])
-
         idx = np.where(labels == lab)[0]
         if idx.size == 0:
             continue
@@ -313,7 +335,7 @@ def main():
     parser.add_argument("--subjects", help="Comma-separated subject IDs (ref_multi).")
     parser.add_argument("--subject", help="Single subject ID (apply).")
     parser.add_argument("--subjects-dir", required=True,
-                        help="FreeSurfer SUBJECTS_DIR.")
+                        help="FreeSurfer SUBJECTS_DIR (top-level, even if nested).")
 
     parser.add_argument("--k-table", required=True,
                         help="Path to k_r JSON (output for ref_multi, input for apply).")
