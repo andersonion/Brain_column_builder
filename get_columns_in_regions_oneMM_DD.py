@@ -261,7 +261,9 @@ def _plot_profile_with_ci(
     plt.close(fig)
 
 
-# ---------------- MAIN ---------------- #
+# ============================================================
+#  ORIGINAL "do everything" function (kept for standalone use)
+# ============================================================
 
 def get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir, contrast, force=False):
 
@@ -429,6 +431,233 @@ def get_columns_in_regions_oneMM_DD(ID, input_dir, output_dir, contrast, force=F
         print("\n[SUMMARY] no regions processed for per-column summary.")
 
     # --------- QA profiles CSV (all regions) ---------
+    if qa_rows:
+        qa_csv_path = qa_dir / f"{ID}_profiles_QA_{contrast}.csv"
+        with open(qa_csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                ["hemi", "region", "depth_index", "mean", "ci_lower", "ci_upper", "n_columns"]
+            )
+            writer.writerows(qa_rows)
+        print(f"[QA] wrote profile CI CSV: {qa_csv_path}")
+    else:
+        print("[QA] no QA rows generated; QA CSV not written.")
+
+
+# ============================================================
+#  NEW: Phase A – generate columns only (no summary/QA)
+#       used by run_column_pipeline before cleaning
+# ============================================================
+
+def generate_columns_only(ID, input_dir, output_dir, contrast, force=False):
+    """
+    Sample along columns and write only the per-column CSVs:
+
+        <output_dir>/<ID>/<contrast>/<contrast>_cols_by_column/
+            <ID>_lh_<region>_cols_<contrast>.csv
+            <ID>_rh_<region>_cols_<contrast>.csv
+
+    NO region means, NO QA plots, NO checksums.
+
+    This is used by run_column_pipeline *before* cross-contrast cleaning.
+    """
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+
+    print(f"\n[INFO] generate_columns_only: subject={ID}, contrast={contrast}")
+    print(f"[INFO] I/O roots:")
+    print(f"    input_dir:  {input_dir}")
+    print(f"    output_dir: {output_dir}")
+    print(f"[INFO] FORCE mode: {force}")
+
+    # load MRI contrast
+    vol = _load_contrast_image(input_dir, ID, contrast)
+
+    # SHARED label coord folder (contrast-agnostic)
+    label_coord_dir = output_dir / ID / "columns" / "label_coord_1mm"
+    if not label_coord_dir.is_dir():
+        raise FileNotFoundError(f"Missing label_coord_1mm in: {label_coord_dir}")
+
+    contrast_dir = output_dir / ID / contrast
+    per_column_dir = contrast_dir / f"{contrast}_cols_by_column"
+    per_column_dir.mkdir(parents=True, exist_ok=True)
+
+    points_num = 21
+
+    for region in REGION_LIST:
+        print(f"\n[REGION] {region}")
+
+        lh_mat = label_coord_dir / f"lh_{region}.mat"
+        rh_mat = label_coord_dir / f"rh_{region}.mat"
+
+        if not lh_mat.is_file() or not rh_mat.is_file():
+            print(f"  -> missing lh/rh coord files, skipping region")
+            continue
+
+        lh_path = per_column_dir / f"{ID}_lh_{region}_cols_{contrast}.csv"
+        rh_path = per_column_dir / f"{ID}_rh_{region}_cols_{contrast}.csv"
+
+        # Skip if both per-column CSVs already exist and not forcing
+        if (not force) and lh_path.is_file() and rh_path.is_file():
+            print("  -> per-column CSVs already exist; skipping sampling for this region")
+            continue
+
+        print("  -> sampling columns for this region")
+
+        # coord matrices
+        lh_cp = _load_region_cp_dwi(lh_mat, "lh")
+        rh_cp = _load_region_cp_dwi(rh_mat, "rh")
+
+        # sample
+        lh_vals = _sample_columns(vol, lh_cp, points_num)
+        rh_vals = _sample_columns(vol, rh_cp, points_num)
+
+        # save per-column output
+        np.savetxt(lh_path, lh_vals, delimiter=",")
+        np.savetxt(rh_path, rh_vals, delimiter=",")
+
+        print(f"  -> LH per-column saved ({lh_vals.shape}) → {lh_path}")
+        print(f"  -> RH per-column saved ({rh_vals.shape}) → {rh_path}")
+
+
+# ============================================================
+#  NEW: Phase B – summarize from existing (cleaned) columns
+#       used by run_column_pipeline *after* cleaning
+# ============================================================
+
+def summarize_from_existing_columns(ID, output_dir, contrast):
+    """
+    After cross-contrast cleaning, re-read the per-column CSVs and produce:
+
+        - per-region mean profiles
+        - QA plots
+        - QA profile CSV
+        - per-column summary CSV
+
+    This assumes that the per-column CSVs have already been generated
+    (and possibly cleaned), and does NOT resample from the volume.
+    """
+    output_dir = Path(output_dir)
+
+    print(f"\n[INFO] summarize_from_existing_columns: subject={ID}, contrast={contrast}")
+    print(f"[INFO] output_dir: {output_dir}")
+
+    contrast_dir = output_dir / ID / contrast
+    per_column_dir = contrast_dir / f"{contrast}_cols_by_column"
+    per_mean_dir = contrast_dir / f"{contrast}_cols_region_mean"
+    qa_dir = contrast_dir / "plots_QA"
+
+    if not per_column_dir.is_dir():
+        print(f"[WARN] summarize_from_existing_columns: missing per-column dir: {per_column_dir}")
+        return
+
+    per_mean_dir.mkdir(parents=True, exist_ok=True)
+    qa_dir.mkdir(parents=True, exist_ok=True)
+
+    summary = []
+    qa_rows = []
+
+    for region in REGION_LIST:
+        print(f"\n[REGION] {region}")
+
+        lh_path = per_column_dir / f"{ID}_lh_{region}_cols_{contrast}.csv"
+        rh_path = per_column_dir / f"{ID}_rh_{region}_cols_{contrast}.csv"
+
+        if not lh_path.is_file() or not rh_path.is_file():
+            print("  -> missing per-column CSV(s), skipping region")
+            continue
+
+        # Load per-column data
+        lh_vals = np.loadtxt(lh_path, delimiter=",")
+        rh_vals = np.loadtxt(rh_path, delimiter=",")
+
+        # Ensure 2D shape
+        if lh_vals.ndim == 1:
+            lh_vals = lh_vals.reshape(1, -1)
+        if rh_vals.ndim == 1:
+            rh_vals = rh_vals.reshape(1, -1)
+
+        if lh_vals.shape[1] != rh_vals.shape[1]:
+            print(
+                f"  [WARN] LH/RH depth mismatch for region {region}: "
+                f"LH={lh_vals.shape}, RH={rh_vals.shape}; using LH depth count."
+            )
+
+        n_depths = lh_vals.shape[1]
+        depth_indices = np.arange(n_depths)
+
+        # region mean depth profiles
+        lh_mean_profile = lh_vals.mean(axis=0).reshape(-1, 1)
+        rh_mean_profile = rh_vals.mean(axis=0).reshape(-1, 1)
+
+        lh_mean_path = per_mean_dir / f"{ID}_lh_{region}_cols_{contrast}_mean.csv"
+        rh_mean_path = per_mean_dir / f"{ID}_rh_{region}_cols_{contrast}_mean.csv"
+
+        np.savetxt(lh_mean_path, lh_mean_profile, delimiter=",")
+        np.savetxt(rh_mean_path, rh_mean_profile, delimiter=",")
+
+        print(f"  -> LH depth-mean saved ({n_depths}×1) → {lh_mean_path}")
+        print(f"  -> RH depth-mean saved ({n_depths}×1) → {rh_mean_path}")
+
+        # per-column summary rows
+        summary.append(["lh", region, lh_vals.shape[0], lh_vals.shape[1], lh_path.name])
+        summary.append(["rh", region, rh_vals.shape[0], rh_vals.shape[1], rh_path.name])
+
+        # QA: mean + CI + plots
+        # LH
+        lh_mean, lh_ci_low, lh_ci_high, lh_n = _compute_mean_and_ci(lh_vals, ci_level=0.95)
+        lh_png_path = qa_dir / f"{ID}_lh_{region}_profile_{contrast}.png"
+        _plot_profile_with_ci(
+            depth_indices,
+            lh_mean,
+            lh_ci_low,
+            lh_ci_high,
+            lh_png_path,
+            title=f"{ID} lh {region} ({contrast})",
+            contrast=contrast,
+        )
+        print(f"  -> LH QA plot saved → {lh_png_path}")
+
+        for d_idx, m, lo, hi in zip(depth_indices, lh_mean, lh_ci_low, lh_ci_high):
+            qa_rows.append(["lh", region, int(d_idx), float(m), float(lo), float(hi), int(lh_n)])
+
+        # RH
+        rh_mean, rh_ci_low, rh_ci_high, rh_n = _compute_mean_and_ci(rh_vals, ci_level=0.95)
+        rh_png_path = qa_dir / f"{ID}_rh_{region}_profile_{contrast}.png"
+        _plot_profile_with_ci(
+            depth_indices,
+            rh_mean,
+            rh_ci_low,
+            rh_ci_high,
+            rh_png_path,
+            title=f"{ID} rh {region} ({contrast})",
+            contrast=contrast,
+        )
+        print(f"  -> RH QA plot saved → {rh_png_path}")
+
+        for d_idx, m, lo, hi in zip(depth_indices, rh_mean, rh_ci_low, rh_ci_high):
+            qa_rows.append(["rh", region, int(d_idx), float(m), float(lo), float(hi), int(rh_n)])
+
+        # region checksum marker (still only depends on ID/contrast/region/version)
+        checksum_path = qa_dir / f"{ID}_{region}_cols_{contrast}.sha256"
+        try:
+            checksum = _region_checksum(ID, contrast, region)
+            checksum_path.write_text(checksum + "\n")
+        except Exception as e:
+            print(f"  [WARN] could not write checksum for region {region}: {e}")
+
+    # per-column summary CSV
+    if summary:
+        summary_path = per_column_dir / f"{ID}_cols_{contrast}_summary.csv"
+        with open(summary_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["hemi", "region", "n_columns", "n_depths", "csv_file"])
+            writer.writerows(summary)
+        print(f"\n[SUMMARY] wrote per-column summary: {summary_path}")
+    else:
+        print("\n[SUMMARY] no regions processed for per-column summary.")
+
+    # QA profiles CSV (all regions)
     if qa_rows:
         qa_csv_path = qa_dir / f"{ID}_profiles_QA_{contrast}.csv"
         with open(qa_csv_path, "w", newline="") as f:
