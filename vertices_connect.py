@@ -86,7 +86,7 @@ def vox2ras_tkreg(voldim, voxres):
     return M
 
 
-def vox2ras_0to1_matlab_form(M0: np.ndarray) -> np.ndarray:
+def vox2ras_0to1(M0: np.ndarray) -> np.ndarray:
     M0 = np.asarray(M0, dtype=float)
     Q = np.zeros((4, 4), dtype=float)
     Q[0:3, 3] = 1.0
