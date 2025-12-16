@@ -86,14 +86,11 @@ def vox2ras_tkreg(voldim, voxres):
     return M
 
 
-def vox2ras_0to1(M):
-    """
-    Convert a vox2ras-tkreg matrix from 0-based to 1-based indexing
-    by shifting coordinates by -0.5.
-    """
-    shift = np.eye(4, dtype=float)
-    shift[0:3, 3] = -0.5
-    return M @ shift
+def vox2ras_0to1_matlab_form(M0: np.ndarray) -> np.ndarray:
+    M0 = np.asarray(M0, dtype=float)
+    Q = np.zeros((4, 4), dtype=float)
+    Q[0:3, 3] = 1.0
+    return np.linalg.inv(np.linalg.inv(M0) + Q)
 
 
 # ----------------- Helpers ----------------- #
