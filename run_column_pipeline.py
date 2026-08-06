@@ -56,21 +56,22 @@ Per-contrast products are written under:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Set, Tuple
 
 import numpy as np
+import matplotlib.pyplot as plt
 from scipy.io import loadmat, savemat
+from scipy.stats import norm
 
 from vertices_connect import vertices_connect
 from coordinates_in_regions_oneMM_DD import coordinates_in_regions_oneMM_DD
-from get_columns_in_regions_oneMM_DD import (
-    generate_columns_only,
-    summarize_from_existing_columns,
-)
+from get_columns_in_regions_oneMM_DD import generate_columns_only
 from get_thickness import get_thickness
 
 
@@ -88,14 +89,39 @@ def _log(message: str = "") -> None:
     print(message, flush=True)
 
 
-def _load_csv_2d(path: Path) -> np.ndarray:
-    """Load a headerless numeric CSV while preserving a two-dimensional shape."""
+def _load_csv_2d(
+    path: Path,
+    *,
+    empty_shape: Tuple[int, int] | None = None,
+) -> np.ndarray:
+    """
+    Load a headerless numeric CSV while preserving a two-dimensional shape.
+
+    ``numpy.savetxt`` represents an array with zero rows as a zero-byte file, so
+    the column count cannot be recovered from the CSV itself. Callers that know
+    the expected shape may supply ``empty_shape`` (for example ``(0, 21)`` for
+    an empty per-column profile file).
+    """
+    if not path.is_file():
+        raise FileNotFoundError(path)
+
+    if path.stat().st_size == 0:
+        if empty_shape is None:
+            return np.empty((0, 0), dtype=float)
+        return np.empty(empty_shape, dtype=float)
+
     try:
-        array = np.loadtxt(path, delimiter=",")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            array = np.loadtxt(path, delimiter=",")
     except ValueError as exc:
         raise ValueError(f"Could not read numeric CSV {path}: {exc}") from exc
 
     array = np.asarray(array, dtype=float)
+    if array.size == 0:
+        if empty_shape is None:
+            return np.empty((0, 0), dtype=float)
+        return np.empty(empty_shape, dtype=float)
     if array.ndim == 0:
         array = array.reshape(1, 1)
     elif array.ndim == 1:
@@ -270,7 +296,10 @@ def _collect_bad_columns_for_contrast(
 
     for path in files:
         region = _find_region_from_filename(subject, contrast, path)
-        values = _load_csv_2d(path)
+        values = _load_csv_2d(path, empty_shape=(0, DEPTH_SAMPLES))
+        if values.shape[0] == 0:
+            _log(f"[CLEAN]   {path.name}: empty region; nothing to scan")
+            continue
         if values.shape[1] != DEPTH_SAMPLES:
             raise ValueError(
                 f"Unexpected depth count in {path}: shape={values.shape}; "
@@ -335,7 +364,7 @@ def _save_master_bad_list(
 
 def _drop_cortical_rows(path: Path, bad_indices: Set[int]) -> Tuple[int, int]:
     """Delete bad cortical-column rows from one headerless per-column CSV."""
-    values = _load_csv_2d(path)
+    values = _load_csv_2d(path, empty_shape=(0, DEPTH_SAMPLES))
     n_before = values.shape[0]
     invalid_indices = sorted(index for index in bad_indices if not 0 <= index < n_before)
     if invalid_indices:
@@ -457,7 +486,7 @@ def clean_bad_columns_across_contrasts(
                     f"Region {region} exists in the bad-column union but the matching "
                     f"contrast CSV is missing: {path}"
                 )
-            n_rows = _load_csv_2d(path).shape[0]
+            n_rows = _load_csv_2d(path, empty_shape=(0, DEPTH_SAMPLES)).shape[0]
             if any(index < 0 or index >= n_rows for index in indices):
                 raise IndexError(
                     f"Bad-column index mismatch for {path}: n_rows={n_rows}, "
@@ -485,6 +514,104 @@ def clean_bad_columns_across_contrasts(
 
     _log("[CLEAN] Cross-contrast cleaning complete.")
     return master_bad
+
+
+
+
+def _summarize_cleaned_contrast(
+    subject: str,
+    output_dir: Path,
+    contrast: str,
+) -> None:
+    """Build means and QA products while treating zero-column regions as valid."""
+    contrast_dir = output_dir / subject / contrast
+    per_column_dir = contrast_dir / f"{contrast}_cols_by_column"
+    mean_dir = contrast_dir / f"{contrast}_cols_region_mean"
+    qa_dir = contrast_dir / "plots_QA"
+    mean_dir.mkdir(parents=True, exist_ok=True)
+    qa_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_rows: List[List[object]] = []
+    qa_rows: List[List[object]] = []
+    files = _per_column_files(subject, contrast, output_dir)
+
+    for path in files:
+        region_key = _find_region_from_filename(subject, contrast, path)
+        hemi, region = region_key.split("_", 1)
+        values = _load_csv_2d(path, empty_shape=(0, DEPTH_SAMPLES))
+
+        if values.shape[1] != DEPTH_SAMPLES:
+            _log(
+                f"[SUMMARY] WARN {path.name}: shape={values.shape}; "
+                f"expected (*, {DEPTH_SAMPLES}); skipping"
+            )
+            continue
+
+        summary_rows.append(
+            [hemi, region, values.shape[0], values.shape[1], path.name]
+        )
+        mean_path = mean_dir / f"{subject}_{region_key}_cols_{contrast}_mean.csv"
+        png_path = qa_dir / f"{subject}_{region_key}_profile_{contrast}.png"
+
+        if values.shape[0] == 0:
+            _log(f"[SUMMARY] {path.name}: zero columns; no mean or QA plot generated")
+            for stale in (mean_path, png_path):
+                if stale.exists():
+                    stale.unlink()
+            continue
+
+        mean = values.mean(axis=0)
+        if values.shape[0] == 1:
+            ci_low = mean.copy()
+            ci_high = mean.copy()
+        else:
+            sem = values.std(axis=0, ddof=1) / np.sqrt(values.shape[0])
+            z = norm.ppf(0.975)
+            ci_low = mean - z * sem
+            ci_high = mean + z * sem
+
+        _atomic_savetxt(mean_path, mean.reshape(-1, 1))
+        depth = np.arange(DEPTH_SAMPLES)
+        fig, ax = plt.subplots()
+        ax.plot(depth, mean)
+        ax.fill_between(depth, ci_low, ci_high, alpha=0.3)
+        ax.set_xlabel("Depth index")
+        ax.set_ylabel(f"{contrast} intensity")
+        ax.set_title(f"{subject} {hemi} {region} ({contrast})")
+        fig.tight_layout()
+        temporary_png = png_path.with_name(f".{png_path.name}.tmp.png")
+        fig.savefig(temporary_png)
+        plt.close(fig)
+        os.replace(temporary_png, png_path)
+
+        for d, m, lo, hi in zip(depth, mean, ci_low, ci_high):
+            qa_rows.append(
+                [hemi, region, int(d), float(m), float(lo), float(hi), values.shape[0]]
+            )
+
+    summary_path = per_column_dir / f"{subject}_cols_{contrast}_summary.csv"
+    temporary_summary = summary_path.with_name(f".{summary_path.name}.tmp")
+    with temporary_summary.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["hemi", "region", "n_columns", "n_depths", "csv_file"])
+        writer.writerows(summary_rows)
+    os.replace(temporary_summary, summary_path)
+
+    qa_path = qa_dir / f"{subject}_profiles_QA_{contrast}.csv"
+    temporary_qa = qa_path.with_name(f".{qa_path.name}.tmp")
+    with temporary_qa.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            ["hemi", "region", "depth_index", "mean", "ci_lower", "ci_upper", "n_columns"]
+        )
+        writer.writerows(qa_rows)
+    os.replace(temporary_qa, qa_path)
+
+    empty_count = sum(int(row[2] == 0) for row in summary_rows)
+    _log(
+        f"[SUMMARY] contrast={contrast}: {len(summary_rows)} hemisphere/region file(s), "
+        f"{empty_count} empty, {len(qa_rows)} QA depth row(s)"
+    )
 
 
 # ============================================================
@@ -519,7 +646,9 @@ def _validate_cleaned_alignment(
         if not csv_path.is_file():
             errors.append(f"Missing coordinate CSV: {csv_path}")
         else:
-            csv_coordinates = _load_csv_2d(csv_path)
+            csv_coordinates = _load_csv_2d(
+                csv_path, empty_shape=coordinates.shape if coordinates.size == 0 else None
+            )
             if csv_coordinates.shape != coordinates.shape:
                 errors.append(
                     f"Coordinate MAT/CSV mismatch for {region}: "
@@ -537,7 +666,9 @@ def _validate_cleaned_alignment(
             if not values_path.is_file():
                 errors.append(f"Missing per-column CSV: {values_path}")
                 continue
-            values = _load_csv_2d(values_path)
+            values = _load_csv_2d(
+                values_path, empty_shape=(0, DEPTH_SAMPLES)
+            )
             if values.shape != (expected_rows, DEPTH_SAMPLES):
                 errors.append(
                     f"Count/depth mismatch for {values_path}: shape={values.shape}, "
@@ -678,8 +809,8 @@ def run_subject_pipeline(
         _log("\n------------------------------------------------------------")
         _log(f"[STEP 2c] Summarize cleaned contrast: {contrast}")
         _log("------------------------------------------------------------")
-        summarize_from_existing_columns(
-            ID=ID,
+        _summarize_cleaned_contrast(
+            subject=ID,
             output_dir=output_dir,
             contrast=contrast,
         )
