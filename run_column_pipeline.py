@@ -59,6 +59,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -240,6 +241,65 @@ def _preflight(
     for contrast, path in resolved_images.items():
         _log(f"[PREFLIGHT] {contrast}: {path}")
     return resolved_images
+
+
+# ============================================================
+# Legacy-output corruption detection and repair
+# ============================================================
+
+
+def _find_legacy_corruption(
+    subject: str,
+    output_dir: Path,
+    contrasts: Sequence[str],
+) -> List[str]:
+    """
+    Detect outputs produced by the earlier broken cleaning implementation.
+
+    The old cleaner could delete depth columns rather than cortical-column
+    rows, leaving nonempty per-column CSVs with fewer than 21 columns. Such
+    files cannot be repaired reliably in place because shared coordinates may
+    also have been modified inconsistently. Empty CSVs are valid and are not
+    treated as corruption.
+    """
+    problems: List[str] = []
+
+    for contrast in contrasts:
+        for path in _per_column_files(subject, contrast, output_dir):
+            values = _load_csv_2d(path, empty_shape=(0, DEPTH_SAMPLES))
+            if values.shape[0] == 0:
+                continue
+            if values.shape[1] != DEPTH_SAMPLES:
+                problems.append(
+                    f"{path}: shape={values.shape}; expected n_columns x {DEPTH_SAMPLES}"
+                )
+
+    return problems
+
+
+def _reset_generated_column_outputs(
+    subject: str,
+    output_dir: Path,
+    contrasts: Sequence[str],
+    reasons: Sequence[str],
+) -> None:
+    """Remove only reproducible column-pipeline outputs and rebuild cleanly."""
+    _log("[REPAIR] Legacy/corrupt column outputs detected.")
+    for reason in reasons:
+        _log(f"[REPAIR]   {reason}")
+
+    targets = [output_dir / subject / "columns"]
+    targets.extend(output_dir / subject / contrast for contrast in contrasts)
+
+    for target in targets:
+        if target.exists():
+            _log(f"[REPAIR] Removing reproducible output: {target}")
+            shutil.rmtree(target)
+
+    _log(
+        "[REPAIR] Shared geometry and requested contrast outputs will be "
+        "regenerated from source inputs."
+    )
 
 
 # ============================================================
@@ -763,6 +823,15 @@ def run_subject_pipeline(
     _log("=============================================================\n")
 
     _preflight(ID, input_dir, output_dir, contrasts, transform_file)
+
+    corruption = _find_legacy_corruption(ID, output_dir, contrasts)
+    if corruption:
+        _reset_generated_column_outputs(
+            subject=ID,
+            output_dir=output_dir,
+            contrasts=contrasts,
+            reasons=corruption,
+        )
 
     # Reusing complete shared geometry is important: coordinates may already
     # have been cross-contrast cleaned. Re-running geometry without forcing
