@@ -71,37 +71,126 @@ _debug_exist() { local p="$1"; [[ -e "$p" ]] && echo "EXISTS: $p" || echo "MISSI
 # -------------------------------
 # Column helper functions
 # -------------------------------
-# Normalize a contrast name to lowercase
+
+# Normalize a contrast name to lowercase.
 normalize_contrast() {
-  echo "$1" | tr '[:upper:]' '[:lower:]';
+  printf '%s
+' "$1" | tr '[:upper:]' '[:lower:]'
 }
 
-# Case-insensitive, regex-based check for a contrast file.
-# Matches filenames of the form:
-#   <runno>_<contrast>.nii.gz
-#   <runno>_<contrast>_anything.nii.gz
-# where <contrast> is strictly delimited by '_' before and '_' or '.' after.
+# Return success when run_column_pipeline.py can resolve a contrast image.
+# Supported layouts:
+#   <root>/<ID>/<ID>_<contrast>_masked.nii.gz
+#   <root>/<ID>_<contrast>_masked.nii.gz
+#   <root>/<ID>/<ID>_<contrast>.nii.gz
+#   <root>/<ID>_<contrast>.nii.gz
+# The same layouts are also accepted with an uncompressed .nii suffix.
 has_contrast_file() {
-  local runno="$1"
-  local contrast_raw="$2"
-  local dir="$3"
-
-  # Normalize contrast for regex consistency
+  local subject="$1"
   local contrast
-  contrast="$(normalize_contrast "$contrast_raw")"
+  contrast="$(normalize_contrast "$2")"
+  local root="$3"
 
-  # Regex (case-insensitive via -iregex):
-  #   .*/<runno>_<contrast>.nii.gz
-  #   .*/<runno>_<contrast>_anything.nii.gz
-  # The character immediately after <contrast> must be '.' or '_' to avoid
-  # partial matches like 'ad' matching 'adc'.
-  local regex=".*/${runno}_${contrast}(\\.nii\\.gz|_[^/]*\\.nii\\.gz)"
+  local candidates=(
+    "${root}/${subject}/${subject}_${contrast}_masked.nii.gz"
+    "${root}/${subject}_${contrast}_masked.nii.gz"
+    "${root}/${subject}/${subject}_${contrast}.nii.gz"
+    "${root}/${subject}_${contrast}.nii.gz"
+    "${root}/${subject}/${subject}_${contrast}_masked.nii"
+    "${root}/${subject}_${contrast}_masked.nii"
+    "${root}/${subject}/${subject}_${contrast}.nii"
+    "${root}/${subject}_${contrast}.nii"
+  )
 
-  if find "$dir" -maxdepth 1 -type f -iregex "$regex" -print -quit >/dev/null 2>&1; then
-    return 0  # found
-  else
-    return 1  # not found
+  local path
+  for path in "${candidates[@]}"; do
+    [[ -s "${path}" ]] && return 0
+  done
+
+  return 1
+}
+
+# Print automatically discovered scalar contrasts, one per line.
+#
+# Discovery is filename-based and scans both supported input layouts. Only
+# exact <ID>_<contrast>[ _masked].nii[.gz] names are considered, which keeps
+# unrelated derivatives from being mistaken for contrast inputs.
+discover_column_contrasts() {
+  local subject="$1"
+  local root="$2"
+  local search_dir path filename stem remainder contrast
+
+  declare -A seen=()
+
+  for search_dir in "${root}" "${root}/${subject}"; do
+    [[ -d "${search_dir}" ]] || continue
+
+    while IFS= read -r -d '' path; do
+      filename="${path##*/}"
+
+      case "${filename}" in
+        *.nii.gz) stem="${filename%.nii.gz}" ;;
+        *.nii)    stem="${filename%.nii}" ;;
+        *)        continue ;;
+      esac
+
+      [[ "${stem}" == "${subject}_"* ]] || continue
+      remainder="${stem#${subject}_}"
+      remainder="${remainder%_masked}"
+      contrast="$(normalize_contrast "${remainder}")"
+
+      # Known non-contrast, non-scalar, or structural inputs.
+      case "${contrast}" in
+        ""|\
+        dwi|dwi4d|dwi_masked|\
+        mask|brain_mask|brainmask|subjspace_mask|\
+        t1|t1w|t2|t2w|\
+        b0|mean_b0|reference|ref|template|\
+        dt|tensor|tensor_masked|\
+        value|vector|eigenvalue|eigenvector|\
+        aparc*|aseg*|wmparc*|ribbon*|\
+        *"_mask"|*"mask")
+          continue
+          ;;
+      esac
+
+      if has_contrast_file "${subject}" "${contrast}" "${root}"; then
+        seen["${contrast}"]=1
+      fi
+    done < <(
+      find "${search_dir}" -maxdepth 1 -type f \
+        \( -iname "${subject}_*.nii.gz" -o -iname "${subject}_*.nii" \) \
+        -print0 2>/dev/null
+    )
+  done
+
+  if (( ${#seen[@]} > 0 )); then
+    printf '%s
+' "${!seen[@]}" | LC_ALL=C sort
   fi
+}
+
+# Lightweight master-script validation. run_column_pipeline.py performs the
+# detailed scientific/output validation; this confirms its principal final
+# products are visible to the calling workflow.
+column_outputs_complete() {
+  local subject="$1"
+  local root="$2"
+  shift 2
+  local contrasts=("$@")
+
+  local subject_out="${root}/${subject}"
+  local contrast
+
+  [[ -s "${subject_out}/columns/bad_columns_master.json" ]] || return 1
+  [[ -s "${subject_out}/thickness/${subject}_thickness_region_means.csv" ]] || return 1
+
+  for contrast in "${contrasts[@]}"; do
+    [[ -s "${subject_out}/${contrast}/${contrast}_cols_by_column/${subject}_cols_${contrast}_summary.csv" ]] || return 1
+    [[ -s "${subject_out}/${contrast}/plots_QA/${subject}_profiles_QA_${contrast}.csv" ]] || return 1
+  done
+
+  return 0
 }
 
 # -------------------------------
@@ -431,66 +520,133 @@ fi
 # -------------------------------------------------------------------
 # Column / thickness pipeline (run_column_pipeline.py)
 # -------------------------------------------------------------------
-# We expect:
-#   - Transform file at: ${output_dir}/${runno}/DWI2T1_dti.dat
-#   - Scalar maps at:    ${output_dir}/${runno}/${runno}_<contrast>[...].nii.gz
-#       where <contrast> is strictly delimited by '_' before and '_' or '.' after.
-#   - FreeSurfer at:     ${output_dir}/${runno}/${runno}
+# Expected upstream products:
+#   - A transform .dat file under ${output_dir}/${runno}
+#   - Scalar maps accepted by has_contrast_file()
+#   - FreeSurfer subject data under ${output_dir}/${runno}/${runno}
 #
-# Contrasts behavior:
-#   - If COLUMN_CONTRASTS is set (space-separated), use exactly that list
-#     (normalized to lowercase) but only keep contrasts that have matching files.
-#       e.g. export COLUMN_CONTRASTS="fa adc ad rd qsm cbf"
-#   - Otherwise, auto-detect among: fa adc ad rd qsm cbf
+# Optional environment controls:
+#   COLUMN_CONTRASTS="adc ad fa rd"  Explicit contrast list. When unset,
+#                                      contrasts are discovered from filenames.
+#   COLUMN_FORCE_ALL=1               Pass --force-all to the Python wrapper.
+#   COLUMN_TRANSFORM_FILE=name.dat   Explicit transform filename under the
+#                                      subject output directory.
+#   COLUMN_PIPELINE_STRICT=0         Warn and continue if the column pipeline
+#                                      fails. Default is 1 (fail the master job).
 
-column_transform="${output_dir}/${runno}/DWI2T1_dti.dat"
 column_input_root="${output_dir}"
-subject_map_dir="${column_input_root}/${runno}"
+column_subject_dir="${output_dir}/${runno}"
+COLUMN_PIPELINE_STRICT="${COLUMN_PIPELINE_STRICT:-1}"
 
-if [[ ! -f "${column_transform}" ]]; then
-  echo "NOTICE: Column pipeline skipped: transform file missing: ${column_transform}"
+declare -a detected_contrasts=()
+
+if [[ -n "${COLUMN_CONTRASTS:-}" ]]; then
+  echo "COLUMN_CONTRASTS requested: ${COLUMN_CONTRASTS}"
+
+  declare -A requested_seen=()
+  for requested in ${COLUMN_CONTRASTS}; do
+    contrast="$(normalize_contrast "${requested}")"
+
+    [[ -n "${contrast}" ]] || continue
+    [[ -z "${requested_seen[${contrast}]:-}" ]] || continue
+    requested_seen["${contrast}"]=1
+
+    if has_contrast_file "${runno}" "${contrast}" "${column_input_root}"; then
+      detected_contrasts+=("${contrast}")
+    else
+      echo "WARNING: Requested contrast '${requested}' was not found for ${runno}."
+    fi
+  done
+
+  echo "COLUMN_CONTRASTS usable: ${detected_contrasts[*]:-(none)}"
 else
-  declare -a detected_contrasts=()
+  mapfile -t detected_contrasts < <(
+    discover_column_contrasts "${runno}" "${column_input_root}"
+  )
+  echo "Auto-detected column contrasts: ${detected_contrasts[*]:-(none)}"
+fi
 
-  if [[ -n "${COLUMN_CONTRASTS:-}" ]]; then
-    echo "COLUMN_CONTRASTS requested: ${COLUMN_CONTRASTS}"
-    # Normalize and keep only those that actually have files
-    tmp_list=()
-    for c in ${COLUMN_CONTRASTS}; do
-      lc="$(normalize_contrast "$c")"
-      if has_contrast_file "${runno}" "${lc}" "${subject_map_dir}"; then
-        tmp_list+=("${lc}")
-      else
-        echo "WARNING: Requested contrast '${c}' (normalized '${lc}') not found for ${runno} in ${subject_map_dir}"
-      fi
-    done
-    detected_contrasts=("${tmp_list[@]}")
-    echo "COLUMN_CONTRASTS usable (after existence check): ${detected_contrasts[*]:-(none)}"
+if (( ${#detected_contrasts[@]} == 0 )); then
+  echo "NOTICE: Column pipeline skipped: no usable scalar contrast maps found for ${runno}."
+else
+  transform_available=0
 
-  else
-    # Auto-detect from candidate set (fa, adc, ad, rd, qsm, cbf)
-    candidate_contrasts=(fa adc ad rd qsm cbf)
-    for c in "${candidate_contrasts[@]}"; do
-      if has_contrast_file "${runno}" "${c}" "${subject_map_dir}"; then
-        detected_contrasts+=("${c}")
-      fi
-    done
-    echo "Auto-detected contrasts for column pipeline: ${detected_contrasts[*]:-(none)}"
+  if [[ -n "${COLUMN_TRANSFORM_FILE:-}" ]]; then
+    if [[ -s "${column_subject_dir}/${COLUMN_TRANSFORM_FILE}" ]]; then
+      transform_available=1
+    else
+      echo "NOTICE: Explicit column transform is missing: ${column_subject_dir}/${COLUMN_TRANSFORM_FILE}"
+    fi
+  elif [[ -s "${column_subject_dir}/DWI2T1_dti.dat" ]] \
+    || [[ -s "${column_subject_dir}/DWI2T1_dti_upsampled.dat" ]] \
+    || [[ -s "${column_subject_dir}/${runno}_DWI2T1_dti.dat" ]] \
+    || [[ -s "${column_subject_dir}/${runno}_DWI2T1_dti_upsampled.dat" ]]; then
+    transform_available=1
+  elif find "${column_subject_dir}" -maxdepth 1 -type f -name '*.dat' -size +0c -print -quit 2>/dev/null | grep -q .; then
+    transform_available=1
   fi
 
-  if (( ${#detected_contrasts[@]} == 0 )); then
-    echo "NOTICE: Column pipeline skipped: no scalar maps found / usable for ${subject_map_dir}"
+  if [[ "${transform_available}" -ne 1 ]]; then
+    echo "NOTICE: Column pipeline skipped: no usable transform .dat file found in ${column_subject_dir}."
   else
+    declare -a column_cmd=(
+      python
+      "${SCRIPT_DIR}/run_column_pipeline.py"
+      --ID "${subject_id}"
+      --input-dir "${column_input_root}"
+      --output-dir "${output_dir}"
+      --contrasts "${detected_contrasts[@]}"
+    )
+
+    if [[ -n "${COLUMN_TRANSFORM_FILE:-}" ]]; then
+      column_cmd+=(--transform-file "${COLUMN_TRANSFORM_FILE}")
+    fi
+
+    if [[ "${COLUMN_FORCE_ALL:-0}" -eq 1 ]]; then
+      column_cmd+=(--force-all)
+    fi
+
+    if column_outputs_complete \
+      "${runno}" "${output_dir}" "${detected_contrasts[@]}" \
+      && [[ "${COLUMN_FORCE_ALL:-0}" -ne 1 ]]; then
+      echo "Column pipeline outputs appear complete for ${runno}; running restart-safe validation/reuse pass."
+    else
+      echo "Column pipeline outputs are incomplete or force mode was requested."
+    fi
+
     echo "Running column pipeline for ${runno}"
     echo "  Input root: ${column_input_root}"
     echo "  Output dir: ${output_dir}"
     echo "  Contrasts:  ${detected_contrasts[*]}"
+    [[ -n "${COLUMN_TRANSFORM_FILE:-}" ]] && echo "  Transform:  ${COLUMN_TRANSFORM_FILE}"
+    echo "  Force all:  ${COLUMN_FORCE_ALL:-0}"
 
-    python "${SCRIPT_DIR}/run_column_pipeline.py" \
-      --ID "${subject_id}" \
-      --input-dir "${column_input_root}" \
-      --output-dir "${output_dir}" \
-      --contrasts "${detected_contrasts[@]}"
+    column_start=$(date +%s)
+
+    if "${column_cmd[@]}"; then
+      column_status=0
+      column_end=$(date +%s)
+      echo "Column pipeline completed successfully in $((column_end - column_start)) seconds" \
+        | tee -a "${TIMING_LOG}"
+
+      if ! column_outputs_complete \
+        "${runno}" "${output_dir}" "${detected_contrasts[@]}"; then
+        echo "ERROR: Column pipeline returned success, but master-script output checks failed." >&2
+        column_status=1
+      fi
+    else
+      column_status=$?
+      echo "ERROR: Column pipeline failed for ${runno} with exit status ${column_status}." >&2
+    fi
+
+    if [[ "${column_status}" -ne 0 ]]; then
+      if [[ "${COLUMN_PIPELINE_STRICT}" -eq 1 ]]; then
+        kill "${VMSTAT_PID}" 2>/dev/null || true
+        exit "${column_status}"
+      else
+        echo "WARNING: COLUMN_PIPELINE_STRICT=0; continuing despite column-pipeline failure."
+      fi
+    fi
   fi
 fi
 
